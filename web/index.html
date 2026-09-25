@@ -99,8 +99,8 @@
       <div class="phone" id="phone">
         <!-- Filled by the script below: an embedded simulator when the Appetize plan allows embeds, otherwise a
              preview that launches the demo on appetize.io. -->
-        <noscript><a href="https://appetize.io/app/jd3uazb6ypx2vzhjnnpb5s745i?device=iphone17pro&amp;params=%7B%22PGDemoData%22%3Atrue%7D">Launch the demo on appetize.io</a></noscript>
-        <div class="hint">Streamed by Appetize.io. The demo data is fictional; nothing you do here touches a real mailbox or phone.</div>
+        <noscript><a href="https://appetize.io/app/jd3uazb6ypx2vzhjnnpb5s745i?device=iphone17pro&amp;params=%7B%22PGDemoData%22%3Atrue%7D">Launch the demo</a></noscript>
+        <div class="hint">The demo data is fictional; nothing you do here touches a real mailbox or phone.</div>
       </div>
     </div>
 
@@ -137,7 +137,7 @@
       button.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>Launch the demo';
       var where = document.createElement("div");
       where.className = "hint";
-      where.textContent = "Opens on appetize.io in a new tab. The first load takes about half a minute while the phone boots.";
+      where.textContent = "Opens in a new tab. The first load takes about half a minute while the phone boots.";
       phone.prepend(link, button, where);
       document.getElementById("how").textContent = "Press Launch the demo to start a session. It opens on a fictional week of flagged emails and calls, every one of them scored by the app's own detector. Each session starts fresh and ends after a few minutes of inactivity.";
     }
