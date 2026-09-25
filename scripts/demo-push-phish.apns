@@ -1,0 +1,6 @@
+{
+  "Simulator Target Bundle": "com.mazooni.PhishGuard",
+  "aps": { "content-available": 1 },
+  "provider": "gmail",
+  "demoFixture": "microsoft365PasswordPhish"
+}

@@ -1,0 +1,137 @@
+# XcodeGen spec → PhishGuard.xcodeproj (generated; regenerate with scripts/bootstrap.sh)
+name: PhishGuard
+options:
+  bundleIdPrefix: com.mazooni
+  deploymentTarget:
+    iOS: "26.0"
+  xcodeVersion: "26.6"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  # Secrets.xcconfig is gitignored; scripts/bootstrap.sh copies it from Secrets.example.xcconfig.
+  disabledValidations: [missingConfigFiles]
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.0"
+
+packages:
+  PhishCore:
+    path: Packages/PhishCore
+  AppAuth:
+    url: https://github.com/openid/AppAuth-iOS
+    from: "3.0.0"
+  MSAL:
+    url: https://github.com/AzureAD/microsoft-authentication-library-for-objc
+    from: "2.15.0"
+  mlx-swift-lm: # MLX
+    url: https://github.com/ml-explore/mlx-swift-lm # MLX
+    from: "3.31.4" # MLX
+  swift-huggingface: # MLX (HubClient/HubCache: model downloads + cache)
+    url: https://github.com/huggingface/swift-huggingface # MLX
+    from: "0.11.0" # MLX
+  swift-transformers: # MLX (Tokenizers: AutoTokenizer for downloaded models)
+    url: https://github.com/huggingface/swift-transformers # MLX
+    from: "1.3.0" # MLX
+
+targets:
+  PhishGuard:
+    type: application
+    platform: iOS
+    sources:
+      # Recursive: Swift sources go to Compile Sources; Resources/Assets.xcassets and Resources/PrivacyInfo.xcprivacy
+      # (the privacy manifest, required at the bundle root for App Store uploads) go to Copy Bundle Resources.
+      - path: App/PhishGuard
+        excludes:
+          - "Config/Secrets.xcconfig"
+    configFiles:
+      Debug: App/PhishGuard/Config/Secrets.xcconfig
+      Release: App/PhishGuard/Config/Secrets.xcconfig
+    info:
+      path: App/PhishGuard/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: PhishGuard
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIBackgroundModes: [remote-notification, fetch, processing]
+        BGTaskSchedulerPermittedIdentifiers:
+          - "$(PRODUCT_BUNDLE_IDENTIFIER).refresh"
+          - "$(PRODUCT_BUNDLE_IDENTIFIER).process"
+        LSApplicationQueriesSchemes: [msauthv2, msauthv3]
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: google-signin
+            CFBundleURLSchemes: ["$(GOOGLE_REVERSED_CLIENT_ID)"]
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: msauth
+            CFBundleURLSchemes: ["msauth.$(PRODUCT_BUNDLE_IDENTIFIER)"]
+        NSUserNotificationsUsageDescription: "PhishGuard notifies you only when a new email looks like phishing or a scam."
+        ITSAppUsesNonExemptEncryption: false
+        # Custom keys read by Config/AppConfig.swift; values come from Config/Secrets.xcconfig build settings.
+        GOOGLE_CLIENT_ID: "$(GOOGLE_CLIENT_ID)"
+        GOOGLE_REVERSED_CLIENT_ID: "$(GOOGLE_REVERSED_CLIENT_ID)"
+        GMAIL_PUBSUB_TOPIC: "$(GMAIL_PUBSUB_TOPIC)"
+        MS_CLIENT_ID: "$(MS_CLIENT_ID)"
+        RELAY_BASE_URL: "$(RELAY_BASE_URL)"
+        RELAY_API_KEY: "$(RELAY_API_KEY)"
+        RELAY_SALT: "$(RELAY_SALT)"
+    entitlements:
+      path: App/PhishGuard/Resources/PhishGuard.entitlements
+      properties:
+        aps-environment: development
+        keychain-access-groups:
+          - "$(AppIdentifierPrefix)com.microsoft.adalcache"
+        com.apple.developer.kernel.increased-memory-limit: true
+        # Call Guard alerts are delivered `time-sensitive` so they break through Focus while the person is on the
+        # call (docs/research/apnsAlerts.md §3). Enabled by the developer, no Apple approval; needs a paid team.
+        com.apple.developer.usernotifications.time-sensitive: true
+    dependencies:
+      - package: PhishCore
+        product: PhishCore
+      - package: AppAuth
+        product: AppAuth
+      - package: MSAL
+        product: MSAL
+      - package: mlx-swift-lm # MLX
+        product: MLXLLM # MLX
+      - package: mlx-swift-lm # MLX
+        product: MLXLMCommon # MLX
+      - package: swift-huggingface # MLX
+        product: HuggingFace # MLX
+      - package: swift-transformers # MLX
+        product: Tokenizers # MLX
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mazooni.PhishGuard
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: "NO"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"
+        SWIFT_EMIT_LOC_STRINGS: "YES"
+    scheme:
+      testTargets:
+        - PhishGuardTests
+      gatherCoverageData: false
+
+  PhishGuardTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: App/PhishGuardTests
+    dependencies:
+      - target: PhishGuard
+      - package: PhishCore
+        product: PhishCore
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: "YES"

@@ -1,0 +1,6 @@
+{
+  "Simulator Target Bundle": "com.mazooni.PhishGuard",
+  "aps": { "content-available": 1 },
+  "provider": "gmail",
+  "accountKey": "88c9b9630189acc1265c686fca97d64a720348160cdae5cdfa11fa5d3974bc58"
+}

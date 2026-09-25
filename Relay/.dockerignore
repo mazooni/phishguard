@@ -1,0 +1,12 @@
+node_modules
+dist
+data
+.env
+.env.*
+!.env.example
+*.p8
+test
+vitest.config.ts
+README.md
+fly.toml
+.git
