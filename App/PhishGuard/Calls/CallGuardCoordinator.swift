@@ -459,7 +459,7 @@ enum CallGuardStatus: Equatable {
 
     var title: String {
         switch self {
-        case .relayNotConfigured: return "Relay not configured"
+        case .relayNotConfigured: return DemoData.isWebDemoBuild ? "Calls are off in this web demo" : "Relay not configured"
         case .notSetUp: return "Call protection is off"
         case .protected: return "Calls protected"
         }
@@ -468,6 +468,10 @@ enum CallGuardStatus: Equatable {
     var detail: String {
         switch self {
         case .relayNotConfigured:
+            if DemoData.isWebDemoBuild {
+                // The browser-hosted demo has no phone line behind it; the seeded history below is what it shows.
+                return "This browser demo has no phone line behind it, so no new calls are checked. Below are past detections from the demo data: on a real iPhone, calls to your guard number are scored while you talk."
+            }
             return "Call Guard runs through the PhishGuard relay. This build has no RELAY_BASE_URL / RELAY_API_KEY, so calls cannot be checked."
         case .notSetUp:
             return "Give people a guard number to call you on. Calls to it ring your phone as usual and are checked for scams while you talk."

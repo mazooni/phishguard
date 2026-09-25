@@ -19,6 +19,8 @@
   <img src="Screenshots/call-alert-lock.jpg" width="230" alt="The time-sensitive scam call alert on the Lock Screen">
 </p>
 
+<p align="center"><a href="https://appetize.io/app/jd3uazb6ypx2vzhjnnpb5s745i?device=iphone17pro&amp;params=%7B%22PGDemoData%22%3Atrue%7D"><strong>Try the demo in your browser</strong></a> (the real app in a streamed iOS Simulator, demo data, calls and sign-in switched off; the <code>web/</code> folder is the landing page for it)</p>
+
 PhishGuard is an iOS 26 app (SwiftUI, Swift 6) that watches a mailbox with read-only access, checks every new
 email on the iPhone itself with a rule engine plus a local language model, throws the email away, and shows a
 notification only when the message looks like phishing or a scam. It keeps no mail and never sends mail content
@@ -312,6 +314,8 @@ touched.
 ```
 project.yml              XcodeGen spec: bundle id, capabilities, Info.plist keys, package dependencies, targets
 scripts/                 bootstrap.sh (Secrets.xcconfig from the example + xcodegen), simulate-push.sh and sample APNs payloads
+web/                     the browser-demo landing page (static; vercel.json at the root serves it); the app it launches is a
+                         Simulator build made with PG_WEB_DEMO=YES, which seeds the demo by itself, streamed by Appetize.io
 App/PhishGuard/          the iOS app target
   Providers/             MailAccountProvider protocol; Gmail/ (AppAuth + Gmail REST), Microsoft/ (MSAL + Graph delta), IMAP/
   Classification/        ClassifierRegistry, EnsembleClassifier, AppleFoundation/, MLX/ (classifier, ModelManager catalog, downloads)

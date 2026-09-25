@@ -38,13 +38,20 @@ enum DemoData {
     /// shipped default is `.medium`.
     static let alertMinimumLevel: RiskLevel = .low
 
-    /// True when this launch asked for the demo (debug builds only).
+    /// True when this launch asked for the demo (debug builds only): the launch argument, or a web-demo build.
     static var isRequested: Bool {
         #if DEBUG
-        return UserDefaults.standard.bool(forKey: launchArgumentKey)
+        return UserDefaults.standard.bool(forKey: launchArgumentKey) || isWebDemoBuild
         #else
         return false
         #endif
+    }
+
+    /// `PG_WEB_DEMO=YES` on the xcodebuild command line (`PGWebDemo` in Info.plist, see project.yml) makes the build
+    /// seed the demo by itself on first launch. It exists for the browser-hosted demo (a cloud Simulator streamed
+    /// into a web page), where nothing can pass a launch argument reliably. Debug builds only, like the argument.
+    static var isWebDemoBuild: Bool {
+        (Bundle.main.object(forInfoDictionaryKey: "PGWebDemo") as? String)?.uppercased() == "YES"
     }
 
     @MainActor

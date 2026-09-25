@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PhishGuard demo</title>
+  <meta name="description" content="Try PhishGuard, an on-device phishing watchdog for iPhone with scam-call protection, in a streamed iOS Simulator.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M32 4 8 14v18c0 15 10 25 24 28 14-3 24-13 24-28V14Z' fill='%233b5bdb'/%3E%3Crect x='19' y='24' width='26' height='18' rx='3' fill='%23fff'/%3E%3Cpath d='m19 27 13 9 13-9' fill='none' stroke='%233b5bdb' stroke-width='2.5'/%3E%3C/svg%3E">
+  <style>
+    :root {
+      --bg: #0b1020; --panel: #121a33; --text: #e8ecf7; --muted: #9aa6c9; --accent: #5b8cff; --ok: #34c759; --warn: #ffb02e;
+      --border: rgba(255,255,255,0.08);
+    }
+    @media (prefers-color-scheme: light) {
+      :root { --bg: #f4f6fb; --panel: #ffffff; --text: #101529; --muted: #5b6480; --accent: #2f5fe8; --border: rgba(0,0,0,0.08); }
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, Segoe UI, Roboto, sans-serif; }
+    a { color: var(--accent); }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 40px 20px 64px; }
+    header { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+    header .logo { width: 44px; height: 44px; border-radius: 12px; background: #3b5bdb; display: grid; place-items: center; flex: none; }
+    header h1 { font-size: 26px; margin: 0; letter-spacing: -0.01em; }
+    header p { margin: 2px 0 0; color: var(--muted); font-size: 15px; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1fr) 440px; gap: 36px; align-items: start; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } .phone { order: -1; } }
+    .phone { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+    .phone iframe { width: 100%; max-width: 420px; aspect-ratio: 420 / 860; height: auto; border: 0; border-radius: 28px; background: transparent; }
+    .phone .hint { color: var(--muted); font-size: 14px; text-align: center; max-width: 420px; }
+    .preview { position: relative; width: 100%; max-width: 300px; border-radius: 34px; overflow: hidden; border: 6px solid #1b2340; box-shadow: 0 24px 60px rgba(0,0,0,0.45); background: #000; }
+    .preview img { display: block; width: 100%; height: auto; }
+    .preview img + img { position: absolute; inset: 0; opacity: 0; transition: opacity .6s; }
+    .preview:hover img + img { opacity: 1; }
+    .launch { display: inline-flex; align-items: center; gap: 10px; padding: 14px 22px; border-radius: 14px; background: var(--accent); color: #fff; font-weight: 700; font-size: 17px; text-decoration: none; box-shadow: 0 10px 30px rgba(47,95,232,0.35); }
+    .launch:hover { filter: brightness(1.08); }
+    .launch svg { width: 18px; height: 18px; }
+    h2 { font-size: 20px; margin: 28px 0 10px; }
+    .lead { font-size: 18px; color: var(--text); margin: 0 0 6px; }
+    p.muted, li.muted { color: var(--muted); }
+    ul { padding-left: 20px; margin: 8px 0 0; }
+    li { margin: 6px 0; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 18px 20px; }
+    .steps li strong { color: var(--text); }
+    .note { border-left: 3px solid var(--warn); padding: 10px 14px; background: var(--panel); border-radius: 0 12px 12px 0; color: var(--muted); font-size: 15px; }
+    .btns { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+    .btn { display: inline-block; padding: 10px 16px; border-radius: 10px; text-decoration: none; font-weight: 600; border: 1px solid var(--border); background: var(--panel); color: var(--text); }
+    .btn.primary { background: var(--accent); color: #fff; border-color: transparent; }
+    footer { margin-top: 40px; color: var(--muted); font-size: 14px; }
+    code { background: var(--panel); border: 1px solid var(--border); padding: 1px 6px; border-radius: 6px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="logo" aria-hidden="true">
+        <svg width="26" height="26" viewBox="0 0 64 64"><path d="M32 4 8 14v18c0 15 10 25 24 28 14-3 24-13 24-28V14Z" fill="#fff"/><rect x="19" y="24" width="26" height="18" rx="3" fill="#3b5bdb"/><path d="m19 27 13 9 13-9" fill="none" stroke="#fff" stroke-width="2.5"/></svg>
+      </div>
+      <div>
+        <h1>PhishGuard</h1>
+        <p>An on-device phishing watchdog for iPhone, with a guard number that warns you during a scam call.</p>
+      </div>
+    </header>
+
+    <div class="grid">
+      <div>
+        <p class="lead">This is the real iOS app, streamed from a cloud iPhone simulator, running in demo mode.</p>
+        <p class="muted">Press <em>Launch the demo</em> to start a session. It opens on a fictional week of flagged emails and calls,
+        every one of them scored by the app's own detector. Each session starts fresh and ends after a few minutes of
+        inactivity.</p>
+
+        <h2>What to try</h2>
+        <div class="card">
+          <ul class="steps">
+            <li><strong>Alerts</strong>: scroll the flagged emails, grouped by day. Red is high risk, orange medium, yellow low.</li>
+            <li><strong>Open an alert</strong>: the confidence, the summary, and <em>Why it was flagged</em> with the evidence behind every reason.</li>
+            <li><strong>Calls</strong>: past scam calls that Call Guard caught, with what the caller said that gave it away.</li>
+            <li><strong>Settings &rsaquo; Demo</strong>: <em>Simulate a phishing email</em> or <em>Simulate a scam call</em>, then watch the notification arrive. Allow notifications when the phone asks.</li>
+            <li><strong>Settings &rsaquo; Diagnostics</strong>: run a test scan over the 33 bundled sample emails and see how each one scores.</li>
+          </ul>
+        </div>
+
+        <h2>What this demo does not do</h2>
+        <p class="note">Live calls and mailbox sign-in are switched off here: this page has no phone line and no mail account behind it.
+        The Calls tab shows past detections only, and adding a Gmail, Outlook or IMAP account is not available. On a real
+        iPhone, calls to your guard number are transcribed and scored while you talk, and new email is checked as it arrives.</p>
+
+        <h2>How it works</h2>
+        <p class="muted">Every email is checked on the phone itself by a rule engine and a local language model; the email is thrown away
+        and only the verdict is kept. Call Guard gives you a guard phone number: calls to it ring your phone as usual while a
+        small relay transcribes and scores the conversation, and warns you, with an urgent notification and a spoken warning
+        only you hear, while the call is still going.</p>
+
+        <div class="btns">
+          <a class="btn primary" href="https://github.com/mazooni/phishguard">Source on GitHub</a>
+          <a class="btn" href="https://github.com/mazooni/phishguard#how-an-email-gets-checked">How an email gets checked</a>
+          <a class="btn" href="https://github.com/mazooni/phishguard#call-guard">Call Guard</a>
+        </div>
+      </div>
+
+      <div class="phone" id="phone">
+        <!-- Filled by the script below: an embedded simulator when the Appetize plan allows embeds, otherwise a
+             preview that launches the demo on appetize.io. -->
+        <noscript><a href="https://appetize.io/app/jd3uazb6ypx2vzhjnnpb5s745i?device=iphone17pro&amp;params=%7B%22PGDemoData%22%3Atrue%7D">Launch the demo on appetize.io</a></noscript>
+        <div class="hint">Streamed by Appetize.io. The demo data is fictional; nothing you do here touches a real mailbox or phone.</div>
+      </div>
+    </div>
+
+    <footer>PhishGuard is a private demo project. It warns; it does not guarantee.</footer>
+  </div>
+
+  <script>
+    // One switch. Appetize only allows embedding on paid plans; until then the page launches the demo on appetize.io
+    // (which works on every plan) and shows a preview here. Flip to true once the plan allows embeds.
+    var EMBED_ENABLED = false;
+    var APPETIZE_KEY = "jd3uazb6ypx2vzhjnnpb5s745i";
+    var DEVICE = "iphone17pro";
+    var query = "device=" + DEVICE + "&scale=auto&deviceColor=black&params=" + encodeURIComponent(JSON.stringify({ PGDemoData: true }));
+    var phone = document.getElementById("phone");
+    if (EMBED_ENABLED) {
+      var frame = document.createElement("iframe");
+      frame.title = "PhishGuard running in an iOS Simulator";
+      frame.src = "https://appetize.io/embed/" + APPETIZE_KEY + "?" + query;
+      frame.setAttribute("allow", "clipboard-write");
+      phone.prepend(frame);
+    } else {
+      var link = document.createElement("a");
+      link.className = "preview";
+      link.href = "https://appetize.io/app/" + APPETIZE_KEY + "?" + query;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.setAttribute("aria-label", "Launch the PhishGuard demo on appetize.io");
+      link.innerHTML = '<img src="preview-alerts.png" alt="PhishGuard alerts list" width="780" height="1696"><img src="preview-calls.png" alt="PhishGuard Calls tab" width="780" height="1696">';
+      var button = document.createElement("a");
+      button.className = "launch";
+      button.href = link.href;
+      button.target = "_blank";
+      button.rel = "noopener";
+      button.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>Launch the demo';
+      var where = document.createElement("div");
+      where.className = "hint";
+      where.textContent = "Opens on appetize.io in a new tab. The first load takes about half a minute while the phone boots.";
+      phone.prepend(link, button, where);
+    }
+  </script>
+</body
+</html>

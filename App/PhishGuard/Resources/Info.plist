@@ -65,6 +65,8 @@
 	<string>$(MS_CLIENT_ID)</string>
 	<key>NSUserNotificationsUsageDescription</key>
 	<string>PhishGuard notifies you only when a new email looks like phishing or a scam.</string>
+	<key>PGWebDemo</key>
+	<string>$(PG_WEB_DEMO)</string>
 	<key>RELAY_API_KEY</key>
 	<string>$(RELAY_API_KEY)</string>
 	<key>RELAY_BASE_URL</key>
