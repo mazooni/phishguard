@@ -1,9 +1,28 @@
-# PhishGuard
+<h1 align="center">PhishGuard</h1>
+
+<p align="center"><strong>An on-device phishing watchdog for iPhone, and a guard number that warns you while a scam call is still happening.</strong></p>
+
+<p align="center">
+  <img alt="iOS 26" src="https://img.shields.io/badge/iOS-26-000000?logo=apple&logoColor=white">
+  <img alt="Swift 6" src="https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white">
+  <img alt="SwiftUI" src="https://img.shields.io/badge/SwiftUI-0A84FF">
+  <img alt="Node 22" src="https://img.shields.io/badge/Node-22-339933?logo=node.js&logoColor=white">
+  <img alt="Mail analysis on device" src="https://img.shields.io/badge/mail%20analysis-on--device-2EA44F">
+  <img alt="Read-only mail access" src="https://img.shields.io/badge/mail%20access-read--only-2EA44F">
+</p>
+
+<p align="center">
+  <img src="Screenshots/alerts.png" width="230" alt="Flagged emails, grouped by day">
+  &nbsp;
+  <img src="Screenshots/call-live.png" width="230" alt="A call scored live while it is happening">
+  &nbsp;
+  <img src="Screenshots/call-alert-lock.jpg" width="230" alt="The time-sensitive scam call alert on the Lock Screen">
+</p>
 
 PhishGuard is an iOS 26 app (SwiftUI, Swift 6) that watches a mailbox with read-only access, checks every new
 email on the iPhone itself with a rule engine plus a local language model, throws the email away, and shows a
 notification only when the message looks like phishing or a scam. It keeps no mail and never sends mail content
-anywhere. It also has Call Guard: a guard phone number you hand out instead of your own. Calls to it ring your
+anywhere. It also has **Call Guard**: a guard phone number you hand out instead of your own. Calls to it ring your
 phone as usual while a small relay transcribes and scores the conversation live, so you are warned with an urgent
 notification and a spoken warning while you are still on the call.
 
@@ -14,6 +33,10 @@ notification and a spoken warning while you are still on the call.
 | Read-only by construction: `gmail.readonly`, Graph `Mail.Read`, and an IMAP client that cannot express a write command | A spam filter: it never touches your mailbox and does not act on your behalf |
 | Quiet: a local notification is posted only for a verdict at or above the level you choose (default Medium) | A guarantee: it warns about what looks malicious; it can miss things and it can be wrong |
 | Call Guard: a guard number whose calls are transcribed and scored as they happen, with a time-sensitive alert and a spoken warning only you hear | Something that listens to your ordinary calls: iOS gives no app access to cellular audio, so only calls placed to the guard number are checked, and for those the audio and transcript leave the phone by design |
+
+**Contents:** [Screenshots](#screenshots) · [How an email gets checked](#how-an-email-gets-checked) ·
+[Call Guard](#call-guard) · [Privacy](#privacy) · [Architecture](#architecture) · [Building](#building) ·
+[Limitations](#limitations)
 
 ## Screenshots
 
