@@ -64,9 +64,8 @@
     <div class="grid">
       <div>
         <p class="lead">This is the real iOS app, streamed from a cloud iPhone simulator, running in demo mode.</p>
-        <p class="muted">Press <em>Launch the demo</em> to start a session. It opens on a fictional week of flagged emails and calls,
-        every one of them scored by the app's own detector. Each session starts fresh and ends after a few minutes of
-        inactivity.</p>
+        <p class="muted" id="how">Tap the phone to start a session. It opens on a fictional week of flagged emails and calls, every
+        one of them scored by the app's own detector. Each session starts fresh and ends after a few minutes of inactivity.</p>
 
         <h2>What to try</h2>
         <div class="card">
@@ -111,7 +110,7 @@
   <script>
     // One switch. Appetize only allows embedding on paid plans; until then the page launches the demo on appetize.io
     // (which works on every plan) and shows a preview here. Flip to true once the plan allows embeds.
-    var EMBED_ENABLED = false;
+    var EMBED_ENABLED = true;
     var APPETIZE_KEY = "jd3uazb6ypx2vzhjnnpb5s745i";
     var DEVICE = "iphone17pro";
     var query = "device=" + DEVICE + "&scale=auto&deviceColor=black&params=" + encodeURIComponent(JSON.stringify({ PGDemoData: true }));
@@ -140,6 +139,7 @@
       where.className = "hint";
       where.textContent = "Opens on appetize.io in a new tab. The first load takes about half a minute while the phone boots.";
       phone.prepend(link, button, where);
+      document.getElementById("how").textContent = "Press Launch the demo to start a session. It opens on a fictional week of flagged emails and calls, every one of them scored by the app's own detector. Each session starts fresh and ends after a few minutes of inactivity.";
     }
   </script>
 </body
