@@ -311,7 +311,7 @@ struct CallsView: View {
             Label("No flagged calls", systemImage: "phone.badge.checkmark")
         } description: {
             Text(coordinator.status.isProtected
-                 ? "Calls to your guard number are checked while you talk. Anything that looks like a scam is listed here."
+                 ? "Calls to your guard number are checked while you talk. Anything that looks like a scam, or a caller whose voice sounds AI-generated, is listed here."
                  : "Once call protection is set up, calls that look like scams are listed here.")
         }
     }
@@ -347,13 +347,23 @@ struct CallsView: View {
     }
 }
 
-/// Row: unread dot, compact risk badge, caller, relative time, the summary and whether the relay alerted.
+/// Row: unread dot, compact risk badge, caller, relative time, the summary, whether the relay alerted and whether
+/// the caller's voice was judged AI-generated.
 struct CallRow: View {
     let record: FlaggedCallRecord
 
     private var caller: String { PhoneNumberFormat.display(record.callerNumber) }
     private var relativeTime: String { record.startedAt.formatted(.relative(presentation: .named)) }
-    private var summary: String { record.summary.isEmpty ? CallAlertText.fallbackBody : record.summary }
+    private var summary: String {
+        CallVoiceDisplay.rowSummary(summary: record.summary, level: record.level, voiceStatus: record.voiceStatus)
+    }
+    private var isVoiceSynthetic: Bool { record.voiceStatus == .synthetic }
+    /// How the row's accessibility label opens: the level, then the voice finding when there is one — and the
+    /// voice finding alone for a call listed only because of it (not "Safe, AI voice detected").
+    private var levelAccessibility: String {
+        if record.isVoiceOnly { return CallVoiceDisplay.detectedTitle }
+        return record.level.displayName + (isVoiceSynthetic ? ", " + CallVoiceDisplay.detectedTitle : "")
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -364,7 +374,11 @@ struct CallRow: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
-                    RiskBadge(level: record.level, size: .compact)
+                    if record.isVoiceOnly {
+                        CallVoiceBadge(compact: true)
+                    } else {
+                        RiskBadge(level: record.level, size: .compact)
+                    }
                     Text(caller)
                         .font(.subheadline.weight(record.isRead ? .regular : .semibold))
                         .lineLimit(1)
@@ -384,6 +398,11 @@ struct CallRow: View {
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.red)
                     }
+                    if isVoiceSynthetic, !record.isVoiceOnly {
+                        Label(CallVoiceDisplay.rowLabel, systemImage: VoiceStatus.synthetic.symbolName)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(VoiceStatus.synthetic.color)
+                    }
                     if let duration = record.durationSeconds {
                         Label(CallDurationFormat.string(seconds: duration), systemImage: "clock")
                             .font(.caption2)
@@ -399,7 +418,7 @@ struct CallRow: View {
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(record.isRead ? "" : "Unread. ")\(record.level.displayName), call from \(caller): \(summary), \(relativeTime)")
+        .accessibilityLabel("\(record.isRead ? "" : "Unread. ")\(levelAccessibility), call from \(caller): \(summary), \(relativeTime)")
     }
 }
 

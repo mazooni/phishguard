@@ -205,8 +205,9 @@ final class ProcessedMessage {
 }
 
 /// What the phone keeps about a call Call Guard flagged (docs/CALLS.md §8, §10): the numbers, the times, the
-/// verdict, the reasons and the summary the relay produced. **Never a transcript** — the relay only keeps one in
-/// memory for the call, and nothing here can hold one. `id` is the relay's `callID`.
+/// verdict, the reasons and the summary the relay produced — and, when the relay checked the caller's voice for
+/// AI-generated speech, what that check concluded. **Never a transcript** — the relay only keeps one in memory
+/// for the call, and nothing here can hold one. `id` is the relay's `callID`.
 @Model
 final class FlaggedCallRecord {
     @Attribute(.unique) var id: UUID
@@ -232,12 +233,24 @@ final class FlaggedCallRecord {
     var recommendedAction: String
     /// `"openai:<model id>"` from the relay, nil when the verdict came from the call rules alone.
     var modelIdentifier: String?
-    /// True when the relay alerted (push and/or spoken warning) during the call.
+    /// True when the relay alerted (push and/or spoken warning) during the call — a scam alert, or the AI-voice
+    /// warning.
     var alerted: Bool
     var isRead: Bool
     /// True for a record the in-app demo produced (Settings › Demo › "Simulate a scam call", or the Demo-mode
     /// seed). It is the only thing turning Demo mode off deletes; a call the relay reported never carries it.
     var isDemo: Bool = false
+    /// `VoiceStatus` raw value of the relay's AI-voice assessment of the caller; nil when no detector ran on the
+    /// call (and on every record from before the check existed). It sits next to the verdict and never changes
+    /// it: a synthetic voice is not by itself a scam. The four voice attributes are additive optionals with a nil
+    /// default, so an existing store migrates lightly (`PersistenceTests.testStoreFromBeforeTheVoiceCheckMigrates`).
+    var voiceStatusRaw: String? = nil
+    /// 0…1: the share of the caller's analysed speech that was judged synthetic.
+    var voiceSyntheticShare: Double? = nil
+    /// 0…1: the detector's confidence in the judgement behind `voiceStatusRaw`.
+    var voiceConfidence: Double? = nil
+    /// `"<vendor>:<model>"` of the detector, e.g. `"modulate:…"`.
+    var voiceProvider: String? = nil
 
     init(
         id: UUID,
@@ -257,7 +270,11 @@ final class FlaggedCallRecord {
         modelIdentifier: String? = nil,
         alerted: Bool,
         isRead: Bool = false,
-        isDemo: Bool = false
+        isDemo: Bool = false,
+        voiceStatusRaw: String? = nil,
+        voiceSyntheticShare: Double? = nil,
+        voiceConfidence: Double? = nil,
+        voiceProvider: String? = nil
     ) {
         self.id = id
         self.callerNumber = callerNumber
@@ -277,10 +294,16 @@ final class FlaggedCallRecord {
         self.alerted = alerted
         self.isRead = isRead
         self.isDemo = isDemo
+        self.voiceStatusRaw = voiceStatusRaw
+        self.voiceSyntheticShare = voiceSyntheticShare
+        self.voiceConfidence = voiceConfidence
+        self.voiceProvider = voiceProvider
     }
 
     /// Builds the record from what the relay reported. Nil when `callID` is not a UUID (the contract says it is;
-    /// a call the app cannot key on is skipped rather than stored under a made-up id).
+    /// a call the app cannot key on is skipped rather than stored under a made-up id). A call without a verdict —
+    /// one kept only because the caller's voice was judged AI-generated — is stored with neutral verdict fields
+    /// (safe, no reasons, no summary): the voice assessment is never turned into a scam verdict.
     convenience init?(summary: CallSummary, isDemo: Bool = false) {
         guard let id = UUID(uuidString: summary.callID) else { return nil }
         let verdict = summary.verdict
@@ -300,8 +323,12 @@ final class FlaggedCallRecord {
             summary: String((verdict?.summary ?? "").prefix(500)),
             recommendedAction: String((verdict?.recommendedAction ?? "").prefix(200)),
             modelIdentifier: verdict?.modelIdentifier,
-            alerted: summary.alerted,
-            isDemo: isDemo
+            alerted: summary.alerted || summary.voice?.alert != nil,
+            isDemo: isDemo,
+            voiceStatusRaw: summary.voice?.status.rawValue,
+            voiceSyntheticShare: summary.voice?.syntheticShare,
+            voiceConfidence: summary.voice?.confidence,
+            voiceProvider: summary.voice?.provider
         )
     }
 
@@ -319,6 +346,9 @@ final class FlaggedCallRecord {
         if let verdict = summary.verdict {
             apply(verdict)
         }
+        if let voice = summary.voice {
+            apply(voice)
+        }
         alerted = alerted || summary.alerted
     }
 
@@ -334,11 +364,44 @@ final class FlaggedCallRecord {
         modelIdentifier = verdict.modelIdentifier
     }
 
+    /// Takes a newer AI-voice assessment for this call — from a summary, or on its own from the relay's
+    /// `voice.updated`. One that carries the AI-voice warning marks the call alerted. Nothing the verdict decided
+    /// (level, category, confidence, reasons, summary) is touched.
+    func apply(_ voice: CallVoiceAssessment) {
+        voiceStatusRaw = voice.status.rawValue
+        voiceSyntheticShare = voice.syntheticShare
+        voiceConfidence = voice.confidence
+        voiceProvider = voice.provider
+        if voice.alert != nil {
+            alerted = true
+        }
+    }
+
+    /// Records that the caller's voice was judged AI-generated when all the app has is the warning push — the
+    /// push is proof of the judgement, but carries no share or confidence, so figures that belonged to an earlier
+    /// status are dropped rather than shown next to it. A record that already says so is left as it is.
+    func markVoiceSynthetic() {
+        guard voiceStatus != .synthetic else { return }
+        voiceStatusRaw = VoiceStatus.synthetic.rawValue
+        voiceSyntheticShare = nil
+        voiceConfidence = nil
+    }
+
     var status: CallStatus? { CallStatus(rawValue: statusRaw) }
     var source: CallSource? { CallSource(rawValue: sourceRaw) }
+    /// nil when no AI-voice detector ran on the call; `.unknown` for a value this app does not know.
+    var voiceStatus: VoiceStatus? { voiceStatusRaw.map { VoiceStatus(rawValue: $0) ?? .unknown } }
     var category: ThreatCategory { ThreatCategory(rawValue: categoryRaw) ?? .safe }
     var level: RiskLevel { RiskLevel(rawValue: levelRaw) ?? .safe }
     var reasons: [Reason] { (try? JSONDecoder().decode([Reason].self, from: reasonsJSON)) ?? [] }
+
+    /// A call listed only because of the caller's voice: judged AI-generated, while the scam check found nothing
+    /// or never ran. Its screens show the voice finding where the verdict would be — not a green "Safe" next to
+    /// a warning.
+    var isVoiceOnly: Bool { voiceStatus == .synthetic && level == .safe }
+    /// A voice-only call for which no scam verdict was ever recorded: the AI-voice warning's placeholder, or a
+    /// call that ended before anything was scored. (A scored safe verdict always has a summary.)
+    var hasNoScamVerdict: Bool { isVoiceOnly && summary.isEmpty && confidence == 0 && reasons.isEmpty }
 
     static func encodeReasons(_ reasons: [CallReason]) -> Data {
         (try? JSONEncoder().encode(reasons.map(\.reason))) ?? Data("[]".utf8)

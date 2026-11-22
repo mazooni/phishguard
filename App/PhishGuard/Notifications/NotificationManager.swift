@@ -143,7 +143,7 @@ final class NotificationManager: Sendable {
     /// `call-<callID>`, mirroring the push's `apns-collapse-id`.
     static func callRequestIdentifier(callID: UUID) -> String { "call-\(callID.uuidString)" }
 
-    /// Every request identifier a delivered alert for `callID` can carry: the local notification's
+    /// Every request identifier a delivered scam alert for `callID` can carry: the local notification's
     /// (`callRequestIdentifier`, upper-case as `UUID.uuidString` prints it) and the relay push's — iOS uses the
     /// `apns-collapse-id` (`call-<callID>`, docs/CALLS.md §5.4) as the delivered request's identifier, and the
     /// relay spells its uuids lower-case (Node's `randomUUID()`). Withdrawing only one spelling would leave the
@@ -152,6 +152,18 @@ final class NotificationManager: Sendable {
         let local = callRequestIdentifier(callID: callID)
         let push = "call-\(callID.uuidString.lowercased())"
         return local == push ? [local] : [local, push]
+    }
+
+    /// `call-voice-<callID>`: the `apns-collapse-id` of the relay's AI-voice warning push, which iOS uses as the
+    /// delivered request's identifier. Lower-case, as the relay spells its uuids; the app never posts this
+    /// notification itself, so there is no upper-case spelling to cover.
+    static func callVoiceAlertIdentifier(callID: UUID) -> String { "call-voice-\(callID.uuidString.lowercased())" }
+
+    /// Everything `clearCallAlert` withdraws for `callID`: the scam alert under both spellings
+    /// (`callAlertIdentifiers`) and the AI-voice warning — a call can have delivered both, under different
+    /// collapse ids, and reading the call answers both.
+    static func callNotificationIdentifiers(callID: UUID) -> [String] {
+        callAlertIdentifiers(callID: callID) + [callVoiceAlertIdentifier(callID: callID)]
     }
 
     static func threadIdentifier(forAccount accountID: UUID?) -> String {
@@ -288,9 +300,10 @@ final class NotificationManager: Sendable {
     }
 
     /// Withdraws a call alert, delivered or still scheduled (a demo record deleted before its alert fires), under
-    /// both spellings of its identifier (`callAlertIdentifiers`) so the relay's push goes too.
+    /// both spellings of its identifier (`callAlertIdentifiers`) so the relay's push goes too — and with it the
+    /// relay's AI-voice warning for the same call (`callNotificationIdentifiers`).
     func clearCallAlert(callID: UUID) {
-        let identifiers = Self.callAlertIdentifiers(callID: callID)
+        let identifiers = Self.callNotificationIdentifiers(callID: callID)
         UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: identifiers)
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: identifiers)
     }

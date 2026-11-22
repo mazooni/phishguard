@@ -48,6 +48,27 @@ final class CallNotificationTests: XCTestCase {
         XCTAssertEqual(Set(identifiers).count, identifiers.count)
     }
 
+    /// The AI-voice warning is a second push for the same call under its own `apns-collapse-id`
+    /// (`call-voice-<callID>`, lower-case as the relay spells it). Reading or deleting the call must withdraw it
+    /// together with the scam alert — and it rides the existing category, so no category is added for it.
+    func testClearingACallAlsoCoversTheVoiceWarningPush() throws {
+        let id = try XCTUnwrap(UUID(uuidString: CallFixtures.callID))
+
+        XCTAssertEqual(NotificationManager.callVoiceAlertIdentifier(callID: id), "call-voice-8f1c2f3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f")
+        XCTAssertEqual(NotificationManager.callVoiceAlertIdentifier(callID: id), "call-voice-\(CallFixtures.callID)")
+
+        let identifiers = NotificationManager.callNotificationIdentifiers(callID: id)
+        XCTAssertEqual(identifiers, ["call-\(id.uuidString)", "call-\(CallFixtures.callID)", "call-voice-\(CallFixtures.callID)"])
+        XCTAssertEqual(Array(identifiers.prefix(2)), NotificationManager.callAlertIdentifiers(callID: id), "the scam alert's two spellings are still there")
+        XCTAssertEqual(Set(identifiers).count, identifiers.count)
+
+        XCTAssertEqual(
+            NotificationManager.makeCategories().map(\.identifier),
+            [NotificationManager.categoryIdentifier, NotificationManager.callAlertCategoryIdentifier],
+            "the voice warning reuses PHISHGUARD_CALL_ALERT"
+        )
+    }
+
     @MainActor
     func testCallAlertContentFollowsThePushRulesAndIsTimeSensitive() throws {
         let record = try makeRecord()

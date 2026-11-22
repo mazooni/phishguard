@@ -9,6 +9,9 @@ import UIKit
 /// reports it, the history of flagged calls in SwiftData, and the alert push that lands while a call is on.
 /// Owned by `AppEnvironment`; the Calls tab and `AppDelegate` talk to it.
 ///
+/// The relay's AI-voice assessment of the caller travels next to the verdict and never feeds it: it gets a call
+/// listed and marked as warned, but the risk level, the category and the summary stay the scam verdict's alone.
+///
 /// Nothing here ever holds a transcript beyond the live card of the call in progress: `LiveCallState.segments`
 /// is in memory for that call only, and `FlaggedCallRecord` has no field for one.
 @MainActor
@@ -30,7 +33,10 @@ final class CallGuardCoordinator {
         /// Partials are replaced in place by id; bounded to `maxLiveSegments`.
         var segments: [TranscriptSegment] = []
         var verdict: CallVerdict?
+        /// The AI-voice assessment of the caller; nil when the relay runs no detector. Independent of `verdict`.
+        var voice: CallVoiceAssessment?
         var alerts: [CallAlert] = []
+        /// True once the relay warned the person: a scam alert, or the AI-voice warning.
         var alerted: Bool
 
         var id: String { callID }
@@ -43,10 +49,24 @@ final class CallGuardCoordinator {
             startedAt = summary.startedDate
             status = summary.status
             verdict = summary.verdict
-            alerted = summary.alerted
+            voice = summary.voice
+            alerted = summary.alerted || summary.voice?.alert != nil
         }
 
         var level: RiskLevel { verdict?.level ?? .safe }
+
+        /// Takes a newer voice assessment; one that carries the AI-voice warning marks the call alerted. A stale
+        /// one (a catch-up replay, a reordered frame) never overwrites a newer one, and nothing takes back
+        /// "synthetic" — the relay keeps it for the rest of the call too. An assessment without a readable
+        /// timestamp (`updatedAt` 0) is taken as it comes rather than dropped as old.
+        mutating func adopt(_ assessment: CallVoiceAssessment) {
+            if let current = voice {
+                if assessment.updatedAt > 0, assessment.updatedAt < current.updatedAt { return }
+                if current.status == .synthetic, assessment.status != .synthetic { return }
+            }
+            voice = assessment
+            if assessment.alert != nil { alerted = true }
+        }
 
         /// Replaces the segment with the same id (a partial becoming final, or a newer partial) or appends.
         mutating func merge(_ segment: TranscriptSegment) {
@@ -174,9 +194,11 @@ final class CallGuardCoordinator {
     }
 
     /// A call is kept when its verdict reached the app's call alert level, or when the relay alerted on it (its
-    /// own line level may have been lower at the time — an alert the person heard must stay findable).
+    /// own line level may have been lower at the time — an alert the person heard must stay findable), or when
+    /// the caller's voice was judged AI-generated, whatever the verdict says and even when there is none.
     func shouldKeep(_ summary: CallSummary) -> Bool {
         if summary.alerted { return true }
+        if summary.voice?.status == .synthetic { return true }
         guard let level = summary.verdict?.level else { return false }
         return AlertFilter.includes(level: level, minimum: settings.callAlertMinimumLevel)
     }
@@ -209,6 +231,9 @@ final class CallGuardCoordinator {
     /// A `kind: call-alert` remote notification: iOS has already shown the banner, so this only fetches the call
     /// and persists it (so the tap has somewhere to land) — it posts nothing. When the relay cannot be reached a
     /// placeholder built from the push itself is kept and refreshed by the next `refreshHistory`.
+    ///
+    /// The AI-voice warning arrives the same way (`voice: "synthetic"`), possibly for a call that has no verdict
+    /// yet: its record is stored all the same, alerted and marked synthetic, with whatever verdict the relay has.
     func handleAlertPush(_ userInfo: [AnyHashable: Any]) async -> UIBackgroundFetchResult {
         guard let payload = CallAlertPushPayload.parse(userInfo) else {
             logger.notice("Call alert push without a usable payload; ignoring")
@@ -226,30 +251,89 @@ final class CallGuardCoordinator {
         do {
             guard let detail = try await client.fetchCall(id: payload.callID) else {
                 logger.notice("Call alert push for a call the relay no longer has")
-                return insertPlaceholder(for: payload) ? .newData : .noData
+                return keepPlaceholder(for: payload) ? .newData : .noData
             }
             if let record = upsert(detail.summary) {
                 // The push is itself proof of an alert. The relay records `alerted` on the session right after
                 // sending it, so a fetch that races the push must not store the call as never alerted.
                 record.alerted = true
+                // Likewise the AI-voice warning is proof of what the detector found, whatever the fetch carried.
+                if payload.isVoiceWarning { record.markVoiceSynthetic() }
             }
             save(what: "call alert")
             if activeCall?.callID == detail.summary.callID, !detail.summary.status.isEnded {
-                activeCall?.verdict = detail.summary.verdict ?? activeCall?.verdict
+                // Not `activeCall?.verdict = … ?? activeCall?.verdict`: with no verdict in the fetch (the AI-voice
+                // warning can precede the first one) that reads `activeCall` while it is being modified, which
+                // the runtime's exclusivity check traps on.
+                if let verdict = detail.summary.verdict { activeCall?.verdict = verdict }
+                if let voice = detail.summary.voice { activeCall?.adopt(voice) }
                 activeCall?.alerted = true
             }
-            logger.info("Call alert push persisted (level=\(payload.level.rawValue, privacy: .public))")
+            if payload.isVoiceWarning {
+                logger.info("AI-voice warning push persisted")
+            } else {
+                logger.info("Call alert push persisted (level=\(payload.level.rawValue, privacy: .public))")
+            }
             return .newData
         } catch {
             logger.error("Fetching the alerted call failed: \(error.localizedDescription, privacy: .public)")
-            return insertPlaceholder(for: payload) ? .newData : .failed
+            return keepPlaceholder(for: payload) ? .newData : .failed
         }
     }
 
-    /// A record from the push alone, only when none exists yet. Returns whether one was written.
+    /// What the push alone can leave behind when the relay did not answer. Returns whether anything was written.
+    private func keepPlaceholder(for payload: CallAlertPushPayload) -> Bool {
+        payload.isVoiceWarning ? insertVoicePlaceholder(for: payload) : insertPlaceholder(for: payload)
+    }
+
+    /// The AI-voice warning's placeholder. The push says nothing about a scam, so the verdict fields stay neutral
+    /// (safe, no reasons, no summary) until `refreshHistory` brings the relay's own; an existing record only
+    /// gains the warning and the voice status — nothing the verdict decided is touched.
+    private func insertVoicePlaceholder(for payload: CallAlertPushPayload) -> Bool {
+        guard let id = UUID(uuidString: payload.callID) else { return false }
+        if let existing = existingRecord(id: id) {
+            existing.alerted = true
+            existing.markVoiceSynthetic()
+            save(what: "AI-voice warning")
+            return true
+        }
+        let record = FlaggedCallRecord(
+            id: id,
+            callerNumber: payload.callerNumber ?? "",
+            guardNumber: line?.guardNumber ?? "",
+            startedAt: payload.startedAt ?? .now,
+            statusRaw: CallStatus.inProgress.rawValue,
+            sourceRaw: CallSource.twilio.rawValue,
+            categoryRaw: ThreatCategory.safe.rawValue,
+            confidence: 0,
+            levelRaw: RiskLevel.safe.rawValue,
+            reasonsJSON: FlaggedCallRecord.encodeReasons([]),
+            summary: "",
+            recommendedAction: "",
+            alerted: true,
+            voiceStatusRaw: VoiceStatus.synthetic.rawValue
+        )
+        container.mainContext.insert(record)
+        save(what: "AI-voice warning placeholder")
+        return true
+    }
+
+    /// A record from the push alone, only when none exists yet — or when the one that exists is itself only the
+    /// AI-voice warning's placeholder, which knows nothing about a scam: that one takes the scam alert's level,
+    /// category, confidence and text and keeps its voice status. A record with a verdict of its own is never
+    /// touched. Returns whether anything was written.
     private func insertPlaceholder(for payload: CallAlertPushPayload) -> Bool {
         guard let id = UUID(uuidString: payload.callID) else { return false }
-        guard existingRecord(id: id) == nil else { return false }
+        if let existing = existingRecord(id: id) {
+            guard existing.hasNoScamVerdict else { return false }
+            existing.categoryRaw = (payload.category ?? .scam).rawValue
+            existing.confidence = payload.confidence ?? 0
+            existing.levelRaw = payload.level.rawValue
+            existing.summary = payload.alertBody ?? ""
+            existing.alerted = true
+            save(what: "call alert over a voice placeholder")
+            return true
+        }
         let record = FlaggedCallRecord(
             id: id,
             callerNumber: payload.callerNumber ?? "",
@@ -319,6 +403,7 @@ final class CallGuardCoordinator {
                 } else {
                     activeCall?.status = live.status
                     if let verdict = live.verdict { adopt(verdict) }
+                    if let voice = live.voice { activeCall?.adopt(voice) }
                 }
             } else {
                 activeCall = nil
@@ -347,6 +432,15 @@ final class CallGuardCoordinator {
             } else {
                 // An alert the relay sent on that final verdict, after the call ended.
                 updateRecord(callID: callID, what: "late alert") { $0.alerted = true }
+            }
+        case .voiceUpdated(let callID, let voice):
+            if activeCall?.callID == callID {
+                activeCall?.adopt(voice)
+            } else {
+                // The AI-voice warning is recorded on the assessment a moment after it is sent, which can be after
+                // `call.ended`: the record kept then takes it now, like a late verdict. A call the app never kept
+                // is left to the next history refresh.
+                updateRecord(callID: callID, what: "voice assessment") { $0.apply(voice) }
             }
         case .callEnded(let summary):
             if shouldKeep(summary) {

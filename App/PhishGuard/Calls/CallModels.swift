@@ -97,6 +97,30 @@ enum Speaker: String, Codable, Sendable, CaseIterable {
     }
 }
 
+/// `VoiceStatus`: what the relay's AI-voice detector says about the **caller's** voice. It is independent of the
+/// scam verdict — a synthetic voice is not by itself a scam, and nothing here ever changes a `CallVerdict`.
+enum VoiceStatus: String, Codable, Sendable, CaseIterable {
+    /// Not enough caller speech yet.
+    case analyzing
+    /// Enough speech, judged natural.
+    case human
+    /// Judged AI-generated; the relay keeps it for the rest of the call.
+    case synthetic
+    /// The call ended (or the analysis stopped) before there was enough speech.
+    case inconclusive
+    /// The detector could not run.
+    case unavailable
+    /// A status this app does not know (a newer relay). Every view treats it as "show nothing".
+    case unknown
+
+    static let fallback = VoiceStatus.unknown
+
+    init(from decoder: any Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = VoiceStatus(rawValue: raw) ?? .fallback
+    }
+}
+
 /// `DemoScenarioId`: the scripted calls the relay can run (§5.1 `POST /v1/devices/calls/demo`, `test-call`).
 enum DemoScenario: String, Codable, Sendable, CaseIterable, Identifiable {
     case grandparent
@@ -336,6 +360,101 @@ struct CallAlert: Codable, Sendable, Equatable {
     var sentDate: Date { Date(timeIntervalSince1970: Double(sentAt) / 1000) }
 }
 
+// MARK: - AI-voice assessment
+
+/// `CallVoiceAlert`: the one AI-voice warning of a call (push and/or spoken), as the relay sent it.
+struct CallVoiceAlert: Codable, Sendable, Equatable {
+    var title: String
+    var subtitle: String
+    var body: String
+    /// ms since epoch.
+    var sentAt: Int
+    var pushed: Bool
+    var spoken: Bool
+
+    enum CodingKeys: String, CodingKey { case title, subtitle, body, sentAt, pushed, spoken }
+
+    init(title: String, subtitle: String, body: String, sentAt: Int, pushed: Bool, spoken: Bool) {
+        self.title = title
+        self.subtitle = subtitle
+        self.body = body
+        self.sentAt = sentAt
+        self.pushed = pushed
+        self.spoken = spoken
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        title = container.lenientString(.title) ?? ""
+        subtitle = container.lenientString(.subtitle) ?? ""
+        body = container.lenientString(.body) ?? ""
+        sentAt = container.lenientInt(.sentAt) ?? 0
+        pushed = container.lenientBool(.pushed) ?? false
+        spoken = container.lenientBool(.spoken) ?? false
+    }
+
+    var sentDate: Date { Date(timeIntervalSince1970: Double(sentAt) / 1000) }
+}
+
+/// `CallVoiceAssessment`: the AI-voice detector's current reading of the caller's voice. The relay leaves it out
+/// of every call no detector ran on. It sits next to the verdict and never feeds it: a call can be flagged
+/// synthetic with a safe verdict, or before any verdict exists.
+struct CallVoiceAssessment: Codable, Sendable, Equatable {
+    var status: VoiceStatus
+    /// 0…1: the share of the caller speech analysed so far that was judged synthetic.
+    var syntheticShare: Double
+    /// 0…1: the detector's mean confidence in the frames behind `status` — confidence in that judgement, not the
+    /// probability that the voice is synthetic.
+    var confidence: Double
+    /// Caller speech analysed so far, in ms.
+    var speechMs: Int
+    /// `"<vendor>:<model>"`, e.g. `"modulate:…"`; `"demo:scripted"` for the relay's scripted calls.
+    var provider: String
+    /// ms since epoch when `status` first became `synthetic`.
+    var detectedAt: Int?
+    /// Present once the AI-voice warning was sent.
+    var alert: CallVoiceAlert?
+    /// ms since epoch.
+    var updatedAt: Int
+
+    enum CodingKeys: String, CodingKey { case status, syntheticShare, confidence, speechMs, provider, detectedAt, alert, updatedAt }
+
+    init(
+        status: VoiceStatus,
+        syntheticShare: Double,
+        confidence: Double,
+        speechMs: Int,
+        provider: String,
+        detectedAt: Int? = nil,
+        alert: CallVoiceAlert? = nil,
+        updatedAt: Int
+    ) {
+        self.status = status
+        self.syntheticShare = syntheticShare
+        self.confidence = confidence
+        self.speechMs = speechMs
+        self.provider = provider
+        self.detectedAt = detectedAt
+        self.alert = alert
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = container.lenientEnum(.status, default: VoiceStatus.fallback)
+        syntheticShare = min(max(container.lenientDouble(.syntheticShare) ?? 0, 0), 1)
+        confidence = min(max(container.lenientDouble(.confidence) ?? 0, 0), 1)
+        speechMs = max(container.lenientInt(.speechMs) ?? 0, 0)
+        provider = container.lenientString(.provider) ?? ""
+        detectedAt = container.lenientInt(.detectedAt)
+        alert = try? container.decodeIfPresent(CallVoiceAlert.self, forKey: .alert)
+        updatedAt = container.lenientInt(.updatedAt) ?? 0
+    }
+
+    var updatedDate: Date { Date(timeIntervalSince1970: Double(updatedAt) / 1000) }
+    var detectedDate: Date? { detectedAt.map { Date(timeIntervalSince1970: Double($0) / 1000) } }
+}
+
 // MARK: - Summary, line
 
 /// `CallSummaryJSON`: what the relay tells the app about one call — never a transcript.
@@ -350,11 +469,14 @@ struct CallSummary: Codable, Sendable, Equatable, Identifiable {
     var durationSeconds: Int?
     var status: CallStatus
     var verdict: CallVerdict?
+    /// True when the relay warned the person during the call: a scam alert, or the AI-voice warning.
     var alerted: Bool
     var alertLevel: RiskLevel?
+    /// The AI-voice assessment of the caller; nil on every call no detector ran on.
+    var voice: CallVoiceAssessment?
 
     enum CodingKeys: String, CodingKey {
-        case callID, source, callerNumber, calledNumber, startedAt, endedAt, durationSeconds, status, verdict, alerted, alertLevel
+        case callID, source, callerNumber, calledNumber, startedAt, endedAt, durationSeconds, status, verdict, alerted, alertLevel, voice
     }
 
     init(
@@ -368,7 +490,8 @@ struct CallSummary: Codable, Sendable, Equatable, Identifiable {
         status: CallStatus,
         verdict: CallVerdict? = nil,
         alerted: Bool,
-        alertLevel: RiskLevel? = nil
+        alertLevel: RiskLevel? = nil,
+        voice: CallVoiceAssessment? = nil
     ) {
         self.callID = callID
         self.source = source
@@ -381,6 +504,7 @@ struct CallSummary: Codable, Sendable, Equatable, Identifiable {
         self.verdict = verdict
         self.alerted = alerted
         self.alertLevel = alertLevel
+        self.voice = voice
     }
 
     init(from decoder: any Decoder) throws {
@@ -396,6 +520,8 @@ struct CallSummary: Codable, Sendable, Equatable, Identifiable {
         verdict = try container.decodeIfPresent(CallVerdict.self, forKey: .verdict)
         alerted = container.lenientBool(.alerted) ?? false
         alertLevel = container.lenientOptionalEnum(.alertLevel)
+        // Lenient on purpose: a voice object this app cannot read must never cost the call its scam verdict.
+        voice = try? container.decodeIfPresent(CallVoiceAssessment.self, forKey: .voice)
     }
 
     var id: String { callID }
@@ -467,6 +593,7 @@ enum LiveEvent: Sendable, Equatable {
     case transcriptSegment(callID: String, segment: TranscriptSegment)
     case verdictUpdated(callID: String, verdict: CallVerdict)
     case callAlert(callID: String, alert: CallAlert)
+    case voiceUpdated(callID: String, voice: CallVoiceAssessment)
     case callEnded(CallSummary)
     case pong
 
@@ -492,6 +619,9 @@ enum LiveEvent: Sendable, Equatable {
         case "call.alert":
             guard let callID = envelope.callID, let alert = envelope.alert else { throw FrameError.missingPayload("alert") }
             return .callAlert(callID: callID, alert: alert)
+        case "voice.updated":
+            guard let callID = envelope.callID, let voice = envelope.voice else { throw FrameError.missingPayload("voice") }
+            return .voiceUpdated(callID: callID, voice: voice)
         case "call.ended":
             guard let call = envelope.call else { throw FrameError.missingPayload("call") }
             return .callEnded(call)
@@ -511,7 +641,9 @@ enum LiveEvent: Sendable, Equatable {
         switch self {
         case .hello, .pong: return nil
         case .callStarted(let call), .callEnded(let call): return call.callID
-        case .callStatus(let callID, _), .transcriptSegment(let callID, _), .verdictUpdated(let callID, _), .callAlert(let callID, _): return callID
+        case .callStatus(let callID, _), .transcriptSegment(let callID, _), .verdictUpdated(let callID, _), .callAlert(let callID, _),
+             .voiceUpdated(let callID, _):
+            return callID
         }
     }
 
@@ -525,8 +657,9 @@ enum LiveEvent: Sendable, Equatable {
         var segment: TranscriptSegment?
         var verdict: CallVerdict?
         var alert: CallAlert?
+        var voice: CallVoiceAssessment?
 
-        enum CodingKeys: String, CodingKey { case type, activeCalls, serverTime, call, callID, status, segment, verdict, alert }
+        enum CodingKeys: String, CodingKey { case type, activeCalls, serverTime, call, callID, status, segment, verdict, alert, voice }
 
         init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -539,6 +672,8 @@ enum LiveEvent: Sendable, Equatable {
             segment = try container.decodeIfPresent(TranscriptSegment.self, forKey: .segment)
             verdict = try container.decodeIfPresent(CallVerdict.self, forKey: .verdict)
             alert = try container.decodeIfPresent(CallAlert.self, forKey: .alert)
+            // Lenient, so a `voice` this app cannot read only ever costs its own `voice.updated` frame.
+            voice = try? container.decodeIfPresent(CallVoiceAssessment.self, forKey: .voice)
         }
     }
 
@@ -551,11 +686,16 @@ enum LiveEvent: Sendable, Equatable {
 // MARK: - APNs alert push (§5.4)
 
 /// The custom keys of the relay's call alert push, next to `aps`: `kind == "call-alert"` plus the call's identity
-/// and the level that triggered the alert. Values are untrusted input; nothing here is logged with call content.
+/// and the level that triggered the alert. The AI-voice warning is the same kind of push with one more key,
+/// `voice: "synthetic"`. Values are untrusted input; nothing here is logged with call content.
 struct CallAlertPushPayload: Sendable, Equatable {
     static let kindKey = "kind"
     static let kind = "call-alert"
+    /// The AI-voice warning's own kind. It is not sent as "call-alert" because it can arrive before the call has
+    /// any verdict, which app builds from before the voice check do not survive (see the relay's voiceDispatcher).
+    static let voiceKind = "call-voice-alert"
     static let callIDKey = "callID"
+    static let voiceKey = "voice"
 
     var callID: String
     var level: RiskLevel
@@ -566,15 +706,24 @@ struct CallAlertPushPayload: Sendable, Equatable {
     var sequence: Int?
     /// `aps.alert.body` — the banner's text, kept for a placeholder record when the relay cannot be reached.
     var alertBody: String?
+    /// `voice` — `.synthetic` on the AI-voice warning, nil on a scam alert (and for a value this app does not know).
+    var voice: VoiceStatus?
+
+    /// True for the AI-voice warning ("the caller's voice appears to be AI-generated"). It is not a scam alert:
+    /// `level` and `category` on such a push say nothing about the caller's voice (and `confidence` is the voice
+    /// detector's, not a scam confidence).
+    var isVoiceWarning: Bool { voice == .synthetic }
 
     /// True when this remote notification is a call alert, whatever else it carries. `AppDelegate` branches on
     /// this **before** the mail silent-push path: a call alert (which also has `content-available`) must never
     /// start a mail scan.
     static func isCallAlert(_ userInfo: [AnyHashable: Any]) -> Bool {
-        (userInfo[kindKey] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) == kind
+        let value = (userInfo[kindKey] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value == kind || value == voiceKind
     }
 
-    /// Parses `userInfo`; nil unless `kind == "call-alert"` and a non-empty `callID` is present.
+    /// Parses `userInfo`; nil unless `kind` is "call-alert" or "call-voice-alert" and a non-empty `callID` is
+    /// present. A "call-voice-alert" is the AI-voice warning whatever its `voice` key says.
     static func parse(_ userInfo: [AnyHashable: Any]) -> CallAlertPushPayload? {
         guard isCallAlert(userInfo) else { return nil }
         guard let callID = (userInfo[callIDKey] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !callID.isEmpty else {
@@ -587,6 +736,10 @@ struct CallAlertPushPayload: Sendable, Equatable {
         let callerNumber = (userInfo["callerNumber"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let startedAt = (userInfo["startedAt"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) }
         let sequence = (userInfo["sequence"] as? NSNumber)?.intValue
+        let isVoiceKind = (userInfo[kindKey] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) == voiceKind
+        let voice: VoiceStatus? = isVoiceKind
+            ? .synthetic
+            : (userInfo[voiceKey] as? String).flatMap { VoiceStatus(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
         var alertBody: String?
         if let aps = userInfo["aps"] as? [AnyHashable: Any] {
             if let alert = aps["alert"] as? [AnyHashable: Any] {
@@ -603,7 +756,8 @@ struct CallAlertPushPayload: Sendable, Equatable {
             callerNumber: callerNumber.flatMap { $0.isEmpty ? nil : $0 },
             startedAt: startedAt,
             sequence: sequence,
-            alertBody: alertBody
+            alertBody: alertBody,
+            voice: voice == .unknown ? nil : voice
         )
     }
 }

@@ -2,7 +2,8 @@ import PhishCore
 import SwiftData
 import SwiftUI
 
-/// Verdict details for one flagged call. There is no transcript here — it was never stored.
+/// Verdict details for one flagged call. There is no transcript here — it was never stored. When the relay's
+/// AI-voice check judged the caller's voice synthetic, that has a card of its own: it is not part of the verdict.
 struct CallDetailView: View {
     @Environment(AppEnvironment.self) private var environment
     @Environment(\.modelContext) private var modelContext
@@ -20,7 +21,10 @@ struct CallDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 verdictCard
-                summaryCard
+                voiceCard
+                if !record.isVoiceOnly {
+                    summaryCard
+                }
                 reasonsSection
                 actionCard
                 factsCard
@@ -72,7 +76,49 @@ struct CallDetailView: View {
 
     // MARK: - Sections
 
+    /// The scam verdict — except on a call listed only because of the caller's voice, where a green "Safe" gauge
+    /// and badge beside "You were warned during the call" would contradict the warning: there the voice finding
+    /// stands in its place.
+    @ViewBuilder
     private var verdictCard: some View {
+        if record.isVoiceOnly {
+            voiceOnlyHeader
+        } else {
+            scamVerdictCard
+        }
+    }
+
+    private var voiceOnlyHeader: some View {
+        Card(tint: VoiceStatus.synthetic.color) {
+            HStack(alignment: .center, spacing: 16) {
+                Image(systemName: VoiceStatus.synthetic.symbolName)
+                    .font(.system(size: 44, weight: .semibold))
+                    .foregroundStyle(VoiceStatus.synthetic.color)
+                    .frame(width: 108, height: 108)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 8) {
+                    CallVoiceBadge()
+                    Text(caller)
+                        .font(.headline)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(record.hasNoScamVerdict ? CallVoiceDisplay.noScamVerdict : CallVoiceDisplay.noScamSigns)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if record.alerted {
+                        Label("You were warned during the call", systemImage: "bell.badge.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private var scamVerdictCard: some View {
         Card(tint: record.level.color) {
             HStack(alignment: .center, spacing: 16) {
                 ConfidenceGauge(confidence: record.confidence, level: record.level, diameter: 108, lineWidth: 10)
@@ -95,6 +141,29 @@ struct CallDetailView: View {
         }
     }
 
+    /// Only for a voice judged AI-generated. Whether the warning was spoken or pushed is not stored, so it is
+    /// not shown; "You were warned during the call" on the verdict card covers both kinds of warning.
+    @ViewBuilder
+    private var voiceCard: some View {
+        if let status = record.voiceStatus, status == .synthetic {
+            Card(tint: status.color) {
+                CardTitle(title: CallVoiceDisplay.detectedTitle, systemImage: status.symbolName, tint: status.color)
+                Text(CallVoiceDisplay.explanation)
+                    .font(.body)
+                    .padding(.top, 6)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let measurement = CallVoiceDisplay.measurement(share: record.voiceSyntheticShare, confidence: record.voiceConfidence) {
+                    Text(measurement)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 6)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+
     private var summaryCard: some View {
         Card {
             CardTitle(title: "Summary", systemImage: "text.alignleft")
@@ -114,8 +183,11 @@ struct CallDetailView: View {
         let reasons = sortedReasons
         if reasons.isEmpty {
             Card {
-                Text("No detailed reasons were recorded for this call.")
+                Text(record.voiceStatus == .synthetic && record.level == .safe
+                     ? CallVoiceDisplay.listedForVoiceOnly
+                     : "No detailed reasons were recorded for this call.")
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         } else {
             ForEach(reasons) { reason in
@@ -126,7 +198,8 @@ struct CallDetailView: View {
 
     @ViewBuilder
     private var actionCard: some View {
-        if !record.recommendedAction.isEmpty {
+        // Not on a voice-only call: its verdict's advice is "Nothing suspicious so far.", under an AI-voice warning.
+        if !record.recommendedAction.isEmpty, !record.isVoiceOnly {
             Card(tint: record.level.color) {
                 CardTitle(title: "What to do", systemImage: "hand.raised.fill", tint: record.level.color)
                 Text(record.recommendedAction)
@@ -152,6 +225,9 @@ struct CallDetailView: View {
                 if !record.guardNumber.isEmpty {
                     detailRow("Guard number", PhoneNumberFormat.display(record.guardNumber))
                 }
+                if record.voiceStatus == .human {
+                    detailRow("Caller's voice", CallVoiceDisplay.humanFact)
+                }
             }
             .padding(.top, 8)
         }
@@ -172,7 +248,12 @@ struct CallDetailView: View {
 
     private var footnote: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(CallModelDisplay.footnote(forIdentifier: record.modelIdentifier))
+            if !record.hasNoScamVerdict {
+                Text(CallModelDisplay.footnote(forIdentifier: record.modelIdentifier))
+            }
+            if let voiceFootnote = CallVoiceDisplay.footnote(status: record.voiceStatus, provider: record.voiceProvider) {
+                Text(voiceFootnote)
+            }
             if record.isDemo {
                 Text("A demo call from a bundled scenario; nothing was transcribed or sent anywhere.")
             }
@@ -199,6 +280,11 @@ struct CallDetailView: View {
         lines.append("Source: \(record.source?.displayName ?? record.sourceRaw)")
         lines.append("Alerted: \(record.alerted ? "yes" : "no")")
         lines.append("Model: \(CallModelDisplay.name(forIdentifier: record.modelIdentifier))")
+        if let voiceLine = CallVoiceDisplay.diagnostics(
+            statusRaw: record.voiceStatusRaw, share: record.voiceSyntheticShare, confidence: record.voiceConfidence, provider: record.voiceProvider
+        ) {
+            lines.append(voiceLine)
+        }
         lines.append("Summary: \(record.summary)")
         lines.append("Recommended: \(record.recommendedAction)")
         lines.append("Reasons:")

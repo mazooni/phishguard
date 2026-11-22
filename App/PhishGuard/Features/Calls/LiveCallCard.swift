@@ -4,6 +4,9 @@ import SwiftUI
 /// The call in progress: who is calling, how long it has been going, the risk gauge, what the relay concluded so
 /// far and the transcript as it arrives (partials in secondary style). Everything here is in memory for this call
 /// only; nothing is persisted.
+///
+/// The AI-voice check of the caller has its own row under the header. It is not part of the verdict: it never
+/// changes the gauge, the badge or the card's tint, and it is there before any verdict exists.
 struct LiveCallCard: View {
     let call: CallGuardCoordinator.LiveCallState
     let connection: CallGuardClient.ConnectionState
@@ -13,14 +16,20 @@ struct LiveCallCard: View {
 
     private var level: RiskLevel { call.level }
     private var tint: Color { call.verdict == nil ? .blue : level.color }
+    /// Before the first verdict. Under an "AI voice detected" row the line says what it is about — scam signs —
+    /// so the two do not read as a contradiction.
+    private var listeningText: String {
+        call.voice?.status == .synthetic ? "Listening… no signs of a scam so far." : "Listening… nothing suspicious so far."
+    }
 
     var body: some View {
         Card(tint: tint) {
             header
+            voiceRow
             if let verdict = call.verdict {
                 verdictSection(verdict)
             } else {
-                Text(call.status.isEnded ? "The call has ended." : "Listening… nothing suspicious so far.")
+                Text(call.status.isEnded ? "The call has ended." : listeningText)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .padding(.top, 10)
@@ -83,6 +92,45 @@ struct LiveCallCard: View {
             // The column takes every point the gauge leaves; a trailing `Spacer` would split that width with it
             // and wrap the chips letter by letter on a 402 pt screen.
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// What the relay's AI-voice detector says about the caller. Nothing for a call no detector ran on, and
+    /// nothing for a status with nothing to tell (inconclusive, unavailable, unknown).
+    @ViewBuilder
+    private var voiceRow: some View {
+        if let voice = call.voice {
+            switch voice.status {
+            case .synthetic:
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: voice.status.symbolName)
+                        .font(.title3)
+                        .foregroundStyle(voice.status.color)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(CallVoiceDisplay.detectedTitle)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(voice.status.color)
+                        Text(CallVoiceDisplay.liveMessage(share: voice.syntheticShare))
+                            .font(.footnote)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(voice.status.color.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .padding(.top, 10)
+                .accessibilityElement(children: .combine)
+            case .analyzing, .human:
+                if let title = voice.status.displayTitle, voice.status == .human || !call.status.isEnded {
+                    Label(title, systemImage: voice.status.symbolName)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 10)
+                }
+            case .inconclusive, .unavailable, .unknown:
+                EmptyView()
+            }
         }
     }
 
@@ -156,6 +204,19 @@ struct LiveCallCard: View {
     call.merge(TranscriptSegment(id: "1", speaker: .caller, text: "Grandma, it's me. I'm in trouble and I need your help.", atMs: 4000, isFinal: true))
     call.merge(TranscriptSegment(id: "2", speaker: .user, text: "Oh no, what happened?", atMs: 9000, isFinal: true))
     call.merge(TranscriptSegment(id: "3", speaker: .caller, text: "They only take gift cards, you have to", atMs: 14000, isFinal: false))
+    return ScrollView {
+        LiveCallCard(call: call, connection: .connected)
+            .padding()
+    }
+    .background(Color(.systemGroupedBackground))
+}
+
+#Preview("AI voice, no verdict yet") {
+    let call = CallGuardCoordinator.LiveCallState(summary: CallSummary(
+        callID: UUID().uuidString, source: .twilio, callerNumber: "+14155550134", calledNumber: DemoCalls.guardNumber,
+        startedAt: Int(Date().addingTimeInterval(-12).timeIntervalSince1970 * 1000), status: .inProgress, alerted: true,
+        voice: CallVoiceAssessment(status: .synthetic, syntheticShare: 0.87, confidence: 0.93, speechMs: 6000, provider: "modulate:preview", updatedAt: 0)
+    ))
     return ScrollView {
         LiveCallCard(call: call, connection: .connected)
             .padding()

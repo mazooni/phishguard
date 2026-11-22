@@ -65,7 +65,8 @@ final class CallGuardCoordinatorTests: XCTestCase {
         alerted: Bool = true,
         status: CallStatus = .completed,
         sequence: Int = 3,
-        summaryText: String = "The caller asks for gift cards."
+        summaryText: String = "The caller asks for gift cards.",
+        voice: CallVoiceAssessment? = nil
     ) -> CallSummary {
         let verdict = level.map { level in
             CallVerdict(
@@ -77,7 +78,26 @@ final class CallGuardCoordinatorTests: XCTestCase {
         return CallSummary(
             callID: callID, source: .twilio, callerNumber: "+14155550134", calledNumber: "+16285550199",
             startedAt: 1_758_600_000_000, endedAt: status.isEnded ? 1_758_600_254_000 : nil,
-            durationSeconds: status.isEnded ? 254 : nil, status: status, verdict: verdict, alerted: alerted, alertLevel: alerted ? level : nil
+            durationSeconds: status.isEnded ? 254 : nil, status: status, verdict: verdict, alerted: alerted, alertLevel: alerted ? level : nil,
+            voice: voice
+        )
+    }
+
+    /// An AI-voice assessment as the relay's detector reports it; `warned` adds the warning the relay sent.
+    private func voice(
+        _ status: VoiceStatus,
+        share: Double = 0,
+        confidence: Double = 0,
+        warned: Bool = false,
+        updatedAt: Int = 1_758_600_030_000
+    ) -> CallVoiceAssessment {
+        let alert = CallVoiceAlert(
+            title: "AI voice detected", subtitle: "Call from +1 (415) 555-0134", body: CallFixtures.voiceAlertBody,
+            sentAt: updatedAt, pushed: true, spoken: true
+        )
+        return CallVoiceAssessment(
+            status: status, syntheticShare: share, confidence: confidence, speechMs: 6200, provider: "modulate:test-model",
+            detectedAt: status == .synthetic ? updatedAt : nil, alert: warned ? alert : nil, updatedAt: updatedAt
         )
     }
 
@@ -560,6 +580,419 @@ final class CallGuardCoordinatorTests: XCTestCase {
         coordinator.apply(.callAlert(callID: CallFixtures.secondCallID, alert: alert))
         XCTAssertEqual(try harness.records().count, 1)
         XCTAssertNil(coordinator.activeCall)
+    }
+
+    // MARK: - AI-voice assessment
+
+    /// The assessment travels next to the verdict: it shows on the live card before any verdict exists, marks the
+    /// call alerted once its warning went out, and never produces or changes a verdict.
+    @MainActor
+    func testVoiceUpdatesFoldIntoTheLiveCardWithoutTouchingTheVerdict() throws {
+        let harness = try makeHarness()
+        let coordinator = harness.coordinator
+        let callID = CallFixtures.callID
+
+        coordinator.apply(.callStarted(summary(callID: callID, level: nil, alerted: false, status: .inProgress, voice: voice(.analyzing, updatedAt: 1_000))))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .analyzing, "the summary's assessment is on the card from the start")
+        XCTAssertNil(coordinator.activeCall?.verdict)
+        XCTAssertEqual(coordinator.activeCall?.alerted, false)
+
+        coordinator.apply(.voiceUpdated(callID: callID, voice: voice(.synthetic, share: 0.9, confidence: 0.92, updatedAt: 2_000)))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .synthetic)
+        XCTAssertEqual(coordinator.activeCall?.voice?.syntheticShare, 0.9)
+        XCTAssertNil(coordinator.activeCall?.verdict, "a synthetic voice is not a verdict")
+        XCTAssertEqual(coordinator.activeCall?.level, .safe)
+        XCTAssertEqual(coordinator.activeCall?.alerted, false, "judged synthetic, not yet warned about")
+
+        // A stale assessment (a catch-up replay, a reordered frame) never overwrites a newer one.
+        coordinator.apply(.voiceUpdated(callID: callID, voice: voice(.analyzing, updatedAt: 1_500)))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .synthetic)
+
+        // The relay records the warning on the assessment: that marks the call alerted.
+        coordinator.apply(.voiceUpdated(callID: callID, voice: voice(.synthetic, share: 0.9, confidence: 0.92, warned: true, updatedAt: 2_100)))
+        XCTAssertEqual(coordinator.activeCall?.alerted, true)
+        XCTAssertNotNil(coordinator.activeCall?.voice?.alert)
+        XCTAssertEqual(coordinator.activeCall?.alerts, [], "the scam alerts stay the scam alerts")
+        XCTAssertNil(coordinator.activeCall?.verdict)
+
+        // Another call's assessment never touches the live card.
+        coordinator.apply(.voiceUpdated(callID: CallFixtures.secondCallID, voice: voice(.human, updatedAt: 9_000)))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .synthetic)
+
+        // The scam verdict arrives on its own and says what it says, whatever the voice check found.
+        let safeVerdict = try XCTUnwrap(summary(callID: callID, level: .safe, sequence: 1).verdict)
+        coordinator.apply(.verdictUpdated(callID: callID, verdict: safeVerdict))
+        XCTAssertEqual(coordinator.activeCall?.level, .safe)
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .synthetic)
+        XCTAssertEqual(try harness.records().count, 0, "nothing is persisted while the call is on")
+
+        // The call ends flagged synthetic with a safe verdict: kept, with the verdict as the relay gave it.
+        let ended = summary(callID: callID, level: .safe, alerted: true, status: .completed, sequence: 2, voice: voice(.synthetic, share: 0.88, confidence: 0.91, warned: true, updatedAt: 3_000))
+        coordinator.apply(.callEnded(ended))
+        XCTAssertNil(coordinator.activeCall)
+        let record = try XCTUnwrap(harness.records().first)
+        XCTAssertEqual(try harness.records().count, 1)
+        XCTAssertEqual(record.level, .safe, "the risk level is the scam verdict's alone")
+        XCTAssertEqual(record.summary, "The caller asks for gift cards.", "and so is the summary")
+        XCTAssertEqual(record.voiceStatus, .synthetic)
+        XCTAssertEqual(record.voiceSyntheticShare, 0.88)
+        XCTAssertEqual(record.voiceConfidence, 0.91)
+        XCTAssertEqual(record.voiceProvider, "modulate:test-model")
+        XCTAssertTrue(record.alerted)
+    }
+
+    @MainActor
+    func testHelloCarriesTheVoiceAssessmentOfTheCallInProgress() throws {
+        let harness = try makeHarness()
+        let coordinator = harness.coordinator
+        let live = summary(callID: CallFixtures.callID, level: nil, alerted: false, status: .inProgress, voice: voice(.analyzing, updatedAt: 1_000))
+
+        coordinator.apply(.hello(activeCalls: [live], serverTime: 1))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .analyzing)
+        XCTAssertEqual(coordinator.activeCall?.alerted, false)
+
+        // A reconnect's hello for the same call brings the newer assessment, warning included.
+        let advanced = summary(callID: CallFixtures.callID, level: nil, alerted: false, status: .inProgress, voice: voice(.synthetic, share: 0.95, confidence: 0.9, warned: true, updatedAt: 2_000))
+        coordinator.apply(.hello(activeCalls: [advanced], serverTime: 2))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .synthetic)
+        XCTAssertEqual(coordinator.activeCall?.alerted, true, "an assessment that carries the warning marks the call alerted")
+        XCTAssertNil(coordinator.activeCall?.verdict)
+
+        // A card built straight from such a summary is alerted too, whatever its `alerted` flag says.
+        let card = CallGuardCoordinator.LiveCallState(summary: advanced)
+        XCTAssertTrue(card.alerted)
+        XCTAssertEqual(card.voice, advanced.voice)
+        XCTAssertNil(CallGuardCoordinator.LiveCallState(summary: summary(level: .high, alerted: true)).voice, "no detector, no assessment")
+    }
+
+    @MainActor
+    func testShouldKeepKeepsASyntheticVoiceWithASafeOrAbsentVerdict() throws {
+        let harness = try makeHarness()
+        let coordinator = harness.coordinator
+        harness.settings.callAlertMinimumLevel = .high
+
+        XCTAssertTrue(coordinator.shouldKeep(summary(level: .safe, alerted: false, voice: voice(.synthetic, share: 0.9, confidence: 0.9))), "synthetic with a safe verdict")
+        XCTAssertTrue(coordinator.shouldKeep(summary(level: nil, alerted: false, voice: voice(.synthetic, share: 0.9, confidence: 0.9))), "synthetic with no verdict at all")
+        for status in [VoiceStatus.analyzing, .human, .inconclusive, .unavailable, .unknown] {
+            XCTAssertFalse(coordinator.shouldKeep(summary(level: nil, alerted: false, voice: voice(status))), "\(status) alone keeps nothing")
+            XCTAssertFalse(coordinator.shouldKeep(summary(level: .medium, alerted: false, voice: voice(status))), "\(status) does not lower the bar either")
+        }
+        XCTAssertTrue(coordinator.shouldKeep(summary(level: .high, alerted: false, voice: voice(.human))), "the scam rule is unchanged")
+        XCTAssertFalse(coordinator.shouldKeep(summary(level: .safe, alerted: false)), "and so is a call nobody checked the voice of")
+
+        // A call that ends with a synthetic voice and no verdict is stored with neutral verdict fields.
+        coordinator.apply(.callEnded(summary(callID: CallFixtures.callID, level: nil, alerted: false, status: .completed, voice: voice(.synthetic, share: 0.9, confidence: 0.85))))
+        // One whose caller sounded human, below the level, leaves nothing behind.
+        coordinator.apply(.callEnded(summary(callID: CallFixtures.secondCallID, level: .low, alerted: false, status: .completed, voice: voice(.human, confidence: 0.97))))
+
+        let records = try harness.records()
+        XCTAssertEqual(records.map { $0.id.uuidString.lowercased() }, [CallFixtures.callID])
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.voiceStatus, .synthetic)
+        XCTAssertEqual(record.voiceSyntheticShare, 0.9)
+        XCTAssertEqual(record.level, .safe, "never a made-up scam level")
+        XCTAssertEqual(record.category, .safe)
+        XCTAssertEqual(record.confidence, 0)
+        XCTAssertTrue(record.reasons.isEmpty)
+        XCTAssertEqual(record.summary, "")
+        XCTAssertNil(record.modelIdentifier)
+        XCTAssertFalse(record.alerted, "judged synthetic, but the relay sent no warning")
+    }
+
+    /// The relay records the AI-voice warning on the assessment a moment after sending it, which can be after
+    /// `call.ended`: the stored record takes it, like a late verdict.
+    @MainActor
+    func testAVoiceUpdateForACallThatIsNotActiveUpdatesTheStoredRecord() throws {
+        let harness = try makeHarness()
+        let coordinator = harness.coordinator
+        let callID = CallFixtures.callID
+
+        coordinator.apply(.callEnded(summary(callID: callID, level: .medium, alerted: false, status: .completed, summaryText: "Provisional.", voice: voice(.synthetic, share: 0.8, confidence: 0.82, updatedAt: 1_000))))
+        let record = try XCTUnwrap(harness.records().first)
+        XCTAssertEqual(record.voiceStatus, .synthetic)
+        XCTAssertFalse(record.alerted)
+
+        coordinator.apply(.voiceUpdated(callID: callID, voice: voice(.synthetic, share: 0.86, confidence: 0.9, warned: true, updatedAt: 2_000)))
+
+        XCTAssertNil(coordinator.activeCall, "no live card comes back for an ended call")
+        XCTAssertTrue(record.alerted, "the warning was sent")
+        XCTAssertEqual(record.voiceSyntheticShare, 0.86)
+        XCTAssertEqual(record.voiceConfidence, 0.9)
+        XCTAssertEqual(record.level, .medium, "nothing the verdict decided is touched")
+        XCTAssertEqual(record.category, .scam)
+        XCTAssertEqual(record.summary, "Provisional.")
+        XCTAssertEqual(record.reasons.map(\.id), ["call.gift_cards"])
+        XCTAssertEqual(try harness.records().count, 1)
+
+        // A call the app never kept is left to the next history refresh: nothing is invented from an assessment.
+        coordinator.apply(.voiceUpdated(callID: CallFixtures.secondCallID, voice: voice(.synthetic, share: 0.9, confidence: 0.9, warned: true)))
+        XCTAssertEqual(try harness.records().count, 1)
+        XCTAssertNil(coordinator.activeCall)
+    }
+
+    @MainActor
+    func testRefreshHistoryKeepsAndUpdatesTheVoiceAssessment() async throws {
+        let harness = try makeHarness()
+        let scamNoVoice = summary(callID: CallFixtures.secondCallID, level: .high, alerted: true)
+        let voiceOnly = summary(callID: CallFixtures.callID, level: nil, alerted: true, voice: voice(.synthetic, share: 0.9, confidence: 0.88, warned: true))
+        RelayStubProtocol.reset(responses: [.init(status: 200, body: try encode([scamNoVoice, voiceOnly]))])
+
+        await harness.coordinator.refreshHistory()
+
+        let first = try harness.records()
+        XCTAssertEqual(first.count, 2)
+        let scam = try XCTUnwrap(first.first { $0.id.uuidString.lowercased() == CallFixtures.secondCallID })
+        XCTAssertNil(scam.voiceStatusRaw, "a call no detector ran on has no voice fields")
+        XCTAssertNil(scam.voiceStatus)
+        XCTAssertNil(scam.voiceSyntheticShare)
+        XCTAssertNil(scam.voiceConfidence)
+        XCTAssertNil(scam.voiceProvider)
+        XCTAssertEqual(scam.level, .high)
+        let flagged = try XCTUnwrap(first.first { $0.id.uuidString.lowercased() == CallFixtures.callID })
+        XCTAssertEqual(flagged.voiceStatus, .synthetic)
+        XCTAssertEqual(flagged.level, .safe)
+        XCTAssertTrue(flagged.alerted)
+
+        // The verdict arrives later; the row is updated in place and keeps what the voice check found.
+        let withVerdict = summary(callID: CallFixtures.callID, level: .medium, alerted: true, voice: voice(.synthetic, share: 0.93, confidence: 0.9, warned: true))
+        RelayStubProtocol.reset(responses: [.init(status: 200, body: try encode([scamNoVoice, withVerdict]))])
+        await harness.coordinator.refreshHistory()
+
+        XCTAssertEqual(try harness.records().count, 2)
+        XCTAssertEqual(flagged.level, .medium)
+        XCTAssertEqual(flagged.voiceStatus, .synthetic)
+        XCTAssertEqual(flagged.voiceSyntheticShare, 0.93)
+        XCTAssertNil(scam.voiceStatusRaw)
+    }
+
+    /// The AI-voice warning push for a call that has no verdict: the tap must still have a record to land on,
+    /// alerted and marked synthetic, and nothing about it may read as a scam verdict.
+    @MainActor
+    func testHandleVoiceWarningPushStoresACallThatHasNoVerdict() async throws {
+        let harness = try makeHarness()
+        let coordinator = harness.coordinator
+        coordinator.apply(.callStarted(summary(callID: CallFixtures.callID, level: nil, alerted: false, status: .inProgress)))
+        let detail = #"{"callID": "\#(CallFixtures.callID)", "source": "twilio", "callerNumber": "+14155550134", "calledNumber": "+16285550199", "startedAt": 1758600000000, "status": "in_progress", "alerted": true, "voice": \#(CallFixtures.voiceJSON)}"#
+        RelayStubProtocol.reset(responses: [.init(status: 200, body: detail)])
+
+        let result = await coordinator.handleAlertPush(CallFixtures.voicePushUserInfo())
+
+        XCTAssertEqual(result, .newData)
+        XCTAssertEqual(RelayStubProtocol.requests.map { $0.url?.absoluteString }, ["https://relay.test/v1/devices/calls/\(CallFixtures.callID)"])
+        let record = try XCTUnwrap(try harness.records().first)
+        XCTAssertEqual(try harness.records().count, 1)
+        XCTAssertEqual(record.id, UUID(uuidString: CallFixtures.callID))
+        XCTAssertTrue(record.alerted)
+        XCTAssertFalse(record.isRead)
+        XCTAssertEqual(record.voiceStatus, .synthetic)
+        XCTAssertEqual(try XCTUnwrap(record.voiceSyntheticShare), 0.87, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(record.voiceConfidence), 0.93, accuracy: 0.0001)
+        XCTAssertEqual(record.voiceProvider, "modulate:velma-2-synthetic-voice-detection-streaming")
+        XCTAssertEqual(record.level, .safe, "no verdict, so no scam level")
+        XCTAssertEqual(record.category, .safe)
+        XCTAssertEqual(record.confidence, 0)
+        XCTAssertEqual(record.summary, "")
+        XCTAssertTrue(record.reasons.isEmpty)
+        XCTAssertEqual(record.status, .inProgress, "still on the phone")
+
+        // The live card of that call takes the assessment and the warning from the same fetch.
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .synthetic)
+        XCTAssertEqual(coordinator.activeCall?.alerted, true)
+        XCTAssertNil(coordinator.activeCall?.verdict)
+    }
+
+    /// The push is proof of what the detector found: a fetch that races it, and comes back without the
+    /// assessment or the `alerted` flag, must not store the call as unwarned or unflagged.
+    @MainActor
+    func testHandleVoiceWarningPushMarksTheCallEvenWhenTheRelayHasNotRecordedItYet() async throws {
+        let harness = try makeHarness()
+        let detail = #"{"callID": "\#(CallFixtures.callID)", "source": "twilio", "callerNumber": "+14155550134", "calledNumber": "+16285550199", "startedAt": 1758600000000, "status": "in_progress", "alerted": false, "voice": {"status": "analyzing", "syntheticShare": 0.4, "confidence": 0, "speechMs": 1200, "provider": "modulate:m", "updatedAt": 1758600020000}}"#
+        RelayStubProtocol.reset(responses: [.init(status: 200, body: detail)])
+
+        let result = await harness.coordinator.handleAlertPush(CallFixtures.voicePushUserInfo())
+
+        XCTAssertEqual(result, .newData)
+        let record = try XCTUnwrap(try harness.records().first)
+        XCTAssertTrue(record.alerted)
+        XCTAssertEqual(record.voiceStatus, .synthetic)
+        XCTAssertNil(record.voiceSyntheticShare, "figures that belonged to the earlier status are not shown next to this one")
+        XCTAssertNil(record.voiceConfidence)
+        XCTAssertEqual(record.level, .safe)
+
+        // The same push for a call that has a scam verdict leaves the verdict exactly as the relay reported it.
+        let second = try makeHarness()
+        let withVerdict = #"{"callID": "\#(CallFixtures.callID)", "source": "twilio", "callerNumber": "+14155550134", "calledNumber": "+16285550199", "startedAt": 1758600000000, "status": "in_progress", "verdict": \#(CallFixtures.verdictJSON), "alerted": true, "alertLevel": "high"}"#
+        RelayStubProtocol.reset(responses: [.init(status: 200, body: withVerdict)])
+        let again = await second.coordinator.handleAlertPush(CallFixtures.voicePushUserInfo())
+        XCTAssertEqual(again, .newData)
+        let scam = try XCTUnwrap(try second.records().first)
+        XCTAssertEqual(scam.level, .high)
+        XCTAssertEqual(scam.category, .scam)
+        XCTAssertEqual(scam.reasons.count, 3)
+        XCTAssertEqual(scam.voiceStatus, .synthetic)
+        XCTAssertTrue(scam.alerted)
+    }
+
+    @MainActor
+    func testHandleVoiceWarningPushKeepsANeutralPlaceholderWhenTheRelayCannotBeReached() async throws {
+        let harness = try makeHarness()
+        RelayStubProtocol.reset(responses: [.init(status: 503), .init(status: 503), .init(status: 503)])
+
+        // Whatever level the push carries, a voice warning alone is never stored as a scam.
+        let result = await harness.coordinator.handleAlertPush(CallFixtures.voicePushUserInfo(level: "high"))
+
+        XCTAssertEqual(result, .newData, "the tap still has a record to land on")
+        let record = try XCTUnwrap(try harness.records().first)
+        XCTAssertEqual(record.id, UUID(uuidString: CallFixtures.callID))
+        XCTAssertTrue(record.alerted)
+        XCTAssertEqual(record.voiceStatus, .synthetic)
+        XCTAssertNil(record.voiceSyntheticShare, "the push carries no figures")
+        XCTAssertNil(record.voiceConfidence)
+        XCTAssertEqual(record.level, .safe, "not labelled a scam")
+        XCTAssertEqual(record.category, .safe)
+        XCTAssertEqual(record.confidence, 0)
+        XCTAssertEqual(record.summary, "", "the voice banner's text is not a scam summary")
+        XCTAssertTrue(record.reasons.isEmpty)
+        XCTAssertEqual(record.callerNumber, "+14155550134")
+        XCTAssertEqual(record.startedAt, Date(timeIntervalSince1970: 1_758_600_000))
+
+        // The same push again, relay still down: nothing is duplicated.
+        RelayStubProtocol.reset(responses: [.init(status: 503), .init(status: 503), .init(status: 503)])
+        let again = await harness.coordinator.handleAlertPush(CallFixtures.voicePushUserInfo())
+        XCTAssertEqual(again, .newData)
+        XCTAssertEqual(try harness.records().count, 1)
+
+        // A later refresh fills the placeholder in with the relay's verdict and keeps the voice status.
+        record.isRead = true
+        try harness.context.save()
+        let reported = summary(level: .medium, alerted: true, voice: voice(.synthetic, share: 0.9, confidence: 0.9, warned: true))
+        RelayStubProtocol.reset(responses: [.init(status: 200, body: try encode([reported]))])
+        await harness.coordinator.refreshHistory()
+        XCTAssertEqual(try harness.records().count, 1)
+        XCTAssertEqual(record.level, .medium)
+        XCTAssertEqual(record.voiceStatus, .synthetic)
+        XCTAssertEqual(record.voiceSyntheticShare, 0.9)
+        XCTAssertTrue(record.isRead)
+
+        // A voice warning for a call the relay forgot (404) leaves a placeholder too.
+        let forgotten = try makeHarness()
+        RelayStubProtocol.reset(responses: [.init(status: 404, body: #"{"error":"not_found"}"#)])
+        let afterForgotten = await forgotten.coordinator.handleAlertPush(CallFixtures.voicePushUserInfo())
+        XCTAssertEqual(afterForgotten, .newData)
+        XCTAssertEqual(try forgotten.records().first?.voiceStatus, .synthetic)
+        XCTAssertEqual(try forgotten.records().first?.level, .safe)
+    }
+
+    /// Relay unreachable throughout: the AI-voice warning arrives first and leaves its neutral placeholder, then
+    /// the scam alert arrives. The scam alert must not be lost on a record that says nothing about a scam.
+    @MainActor
+    func testScamAlertPushFillsInAVoiceOnlyPlaceholderWhenTheRelayCannotBeReached() async throws {
+        let harness = try makeHarness()
+        RelayStubProtocol.reset(responses: [.init(status: 503), .init(status: 503), .init(status: 503)])
+        _ = await harness.coordinator.handleAlertPush(CallFixtures.voicePushUserInfo())
+        let record = try XCTUnwrap(try harness.records().first)
+        XCTAssertTrue(record.isVoiceOnly)
+        XCTAssertTrue(record.hasNoScamVerdict)
+
+        RelayStubProtocol.reset(responses: [.init(status: 503), .init(status: 503), .init(status: 503)])
+        let result = await harness.coordinator.handleAlertPush(CallFixtures.pushUserInfo())
+
+        XCTAssertEqual(result, .newData)
+        XCTAssertEqual(try harness.records().count, 1)
+        XCTAssertEqual(record.level, .high)
+        XCTAssertEqual(record.category, .scam)
+        XCTAssertEqual(record.confidence, 0.92, accuracy: 0.0001)
+        XCTAssertEqual(record.summary, "Asks for gift cards · Says not to tell anyone")
+        XCTAssertTrue(record.alerted)
+        XCTAssertEqual(record.voiceStatus, .synthetic, "the voice finding stays")
+        XCTAssertFalse(record.isVoiceOnly)
+
+        // A second scam push finds a record with a verdict of its own now and leaves it alone, as before.
+        RelayStubProtocol.reset(responses: [.init(status: 503), .init(status: 503), .init(status: 503)])
+        let again = await harness.coordinator.handleAlertPush(CallFixtures.pushUserInfo(level: "medium"))
+        XCTAssertEqual(again, .failed)
+        XCTAssertEqual(record.level, .high)
+    }
+
+    /// `isVoiceOnly` is what the screens branch on: synthetic voice with a safe (or absent) scam verdict.
+    @MainActor
+    func testVoiceOnlyRecordsAreToldApartFromScoredOnes() throws {
+        let harness = try makeHarness()
+        // Scored safe by the relay, voice synthetic: voice-only, but a verdict was recorded.
+        let scoredSafe = try XCTUnwrap(harness.coordinator.upsert(summary(level: .safe, alerted: false, summaryText: "No signs of a scam so far.", voice: voice(.synthetic, share: 0.9, confidence: 0.9, warned: true))))
+        XCTAssertTrue(scoredSafe.isVoiceOnly)
+        XCTAssertFalse(scoredSafe.hasNoScamVerdict)
+        // No verdict at all.
+        let unscored = try XCTUnwrap(harness.coordinator.upsert(summary(callID: CallFixtures.secondCallID, level: nil, alerted: false, voice: voice(.synthetic, share: 0.9, confidence: 0.9, warned: true))))
+        XCTAssertTrue(unscored.isVoiceOnly)
+        XCTAssertTrue(unscored.hasNoScamVerdict)
+        // A scam call with a synthetic voice is a scam call.
+        scoredSafe.apply(CallVerdict(
+            sequence: 4, category: .scam, confidence: 0.8, level: .medium, reasons: [], summary: "Asks for a code.",
+            recommendedAction: "Hang up.", heuristicScore: 0.8, updatedAt: 1_758_600_130_000
+        ))
+        XCTAssertFalse(scoredSafe.isVoiceOnly)
+        XCTAssertFalse(scoredSafe.hasNoScamVerdict)
+        // A human-sounding safe call is not voice-only either.
+        unscored.apply(voice(.human, share: 0.02, confidence: 0.9))
+        XCTAssertFalse(unscored.isVoiceOnly)
+    }
+
+    /// The live card never drops an assessment for want of a timestamp, and never takes "synthetic" back.
+    @MainActor
+    func testLiveCardTakesAnUnstampedAssessmentAndKeepsSynthetic() throws {
+        let harness = try makeHarness()
+        let coordinator = harness.coordinator
+        let callID = CallFixtures.callID
+        coordinator.apply(.callStarted(summary(level: nil, alerted: false, status: .inProgress, voice: voice(.analyzing, updatedAt: 1_000))))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .analyzing)
+
+        // `updatedAt` missing or unreadable decodes as 0: taken as it comes, not discarded as older than 1000.
+        coordinator.apply(.voiceUpdated(callID: callID, voice: voice(.synthetic, share: 0.9, confidence: 0.9, updatedAt: 0)))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .synthetic)
+
+        // Nothing takes it back, stamped later or not at all.
+        coordinator.apply(.voiceUpdated(callID: callID, voice: voice(.human, updatedAt: 5_000)))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .synthetic)
+        coordinator.apply(.voiceUpdated(callID: callID, voice: voice(.analyzing, updatedAt: 0)))
+        XCTAssertEqual(coordinator.activeCall?.voice?.status, .synthetic)
+
+        // A later synthetic one (the warning recorded) still lands.
+        coordinator.apply(.voiceUpdated(callID: callID, voice: voice(.synthetic, share: 0.9, confidence: 0.9, warned: true, updatedAt: 6_000)))
+        XCTAssertEqual(coordinator.activeCall?.voice?.alert?.pushed, true)
+        XCTAssertEqual(coordinator.activeCall?.alerted, true)
+    }
+
+    /// A call already listed for its scam verdict gets the voice warning while the relay is unreachable: the
+    /// record gains the voice status and the warning, and keeps everything the verdict decided.
+    @MainActor
+    func testVoiceWarningPushForAnExistingRecordNeverTouchesItsVerdict() async throws {
+        let harness = try makeHarness()
+        harness.coordinator.upsert(summary(level: .high, alerted: false, status: .inProgress))
+        try harness.context.save()
+        RelayStubProtocol.reset(responses: [.init(status: 503), .init(status: 503), .init(status: 503)])
+
+        let result = await harness.coordinator.handleAlertPush(CallFixtures.voicePushUserInfo())
+
+        XCTAssertEqual(result, .newData)
+        let records = try harness.records()
+        XCTAssertEqual(records.count, 1)
+        let record = try XCTUnwrap(records.first)
+        XCTAssertEqual(record.voiceStatus, .synthetic)
+        XCTAssertTrue(record.alerted)
+        XCTAssertEqual(record.level, .high)
+        XCTAssertEqual(record.category, .scam)
+        XCTAssertEqual(record.summary, "The caller asks for gift cards.")
+        XCTAssertEqual(record.reasons.map(\.id), ["call.gift_cards"])
+
+        // And the scam alert's own placeholder path is as it was: it has no voice fields.
+        let scamOnly = try makeHarness()
+        RelayStubProtocol.reset(responses: [.init(status: 503), .init(status: 503), .init(status: 503)])
+        _ = await scamOnly.coordinator.handleAlertPush(CallFixtures.pushUserInfo(callID: CallFixtures.secondCallID, level: "medium"))
+        let placeholder = try XCTUnwrap(try scamOnly.records().first)
+        XCTAssertNil(placeholder.voiceStatusRaw)
+        XCTAssertEqual(placeholder.level, .medium)
+        XCTAssertEqual(placeholder.category, .scam)
     }
 
     /// Every error code the relay's §5.1 routes answer gets plain words, never a bare "Relay HTTP …".

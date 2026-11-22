@@ -28,7 +28,9 @@ enum CallFixtures {
     }
     """
 
-    static func summaryJSON(callID: String = CallFixtures.callID, status: String = "completed", alerted: Bool = true, withVerdict: Bool = true) -> String {
+    /// `voice` is a `CallVoiceAssessment` object as JSON text; nil leaves the key out, as the relay does on every
+    /// call no AI-voice detector ran on.
+    static func summaryJSON(callID: String = CallFixtures.callID, status: String = "completed", alerted: Bool = true, withVerdict: Bool = true, voice: String? = nil) -> String {
         """
         {
           "callID": "\(callID)",
@@ -40,6 +42,7 @@ enum CallFixtures {
           "durationSeconds": 254,
           "status": "\(status)",
           \(withVerdict ? "\"verdict\": \(verdictJSON)," : "")
+          \(voice.map { "\"voice\": \($0)," } ?? "")
           "alerted": \(alerted),
           "alertLevel": "high"
         }
@@ -57,6 +60,39 @@ enum CallFixtures {
     static let alertJSON = """
     {"sequence": 3, "level": "high", "title": "Likely scam call", "subtitle": "Call from +1 (415) 555-0134", "body": "Asks for gift cards · Claims to be a grandchild in trouble", "sentAt": 1758600121000, "pushed": true, "spoken": false}
     """
+
+    /// `CallVoiceAssessment` once the caller's voice was judged AI-generated and the warning went out.
+    static let voiceJSON = """
+    {
+      "status": "synthetic",
+      "syntheticShare": 0.87,
+      "confidence": 0.93,
+      "speechMs": 6200,
+      "provider": "modulate:velma-2-synthetic-voice-detection-streaming",
+      "detectedAt": 1758600030000,
+      "alert": {"title": "AI voice detected", "subtitle": "Call from +1 (415) 555-0134", "body": "The caller's voice appears to be AI-generated. If they say they are someone you know, hang up and call them back on a number you trust.", "sentAt": 1758600031000, "pushed": true, "spoken": true},
+      "updatedAt": 1758600031000
+    }
+    """
+
+    /// The relay's fixed body for the AI-voice warning (`VOICE_ALERT_BODY` in Relay/src/calls/alerts/text.ts).
+    static let voiceAlertBody = "The caller's voice appears to be AI-generated. If they say they are someone you know, hang up and call them back on a number you trust."
+
+    /// The AI-voice warning push as the relay builds it (Relay/src/calls/alerts/voiceDispatcher.ts): its own
+    /// `kind`, `voice: "synthetic"`, and next to them the usual keys. `level` mirrors the scam verdict at that
+    /// moment ("low" without one, never "safe") and `confidence` is the voice detector's; the app never reads a
+    /// scam level or confidence out of this push.
+    static func voicePushUserInfo(callID: String = CallFixtures.callID, level: String = "low") -> [AnyHashable: Any] {
+        [
+            "aps": [
+                "alert": ["title": "AI voice detected", "subtitle": "Call from +1 (415) 555-0134", "body": voiceAlertBody],
+                "sound": "default", "interruption-level": "time-sensitive", "relevance-score": 1,
+                "thread-id": "com.mazooni.PhishGuard.calls", "category": "PHISHGUARD_CALL_ALERT", "content-available": 1,
+            ],
+            "kind": "call-voice-alert", "callID": callID, "level": level, "confidence": 0.93, "category": "safe",
+            "callerNumber": "+14155550134", "startedAt": 1758600000000, "sequence": 0, "voice": "synthetic",
+        ]
+    }
 
     /// The §5.4 push, as `userInfo` hands it to the app.
     static func pushUserInfo(callID: String = CallFixtures.callID, level: String = "high") -> [AnyHashable: Any] {
@@ -400,6 +436,252 @@ final class CallModelsTests: XCTestCase {
         XCTAssertNil(CallAlertPushPayload.parse(["kind": 7, "callID": "x"]))
         XCTAssertNil(CallAlertPushPayload.parse([:]))
         XCTAssertFalse(CallAlertPushPayload.isCallAlert(["aps": ["content-available": 1]]))
+    }
+
+    // MARK: - AI-voice assessment
+
+    func testVoiceAssessmentFixtureDecodesEveryField() throws {
+        let voice = try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(CallFixtures.voiceJSON))
+
+        XCTAssertEqual(voice.status, .synthetic)
+        XCTAssertEqual(voice.syntheticShare, 0.87, accuracy: 0.0001)
+        XCTAssertEqual(voice.confidence, 0.93, accuracy: 0.0001)
+        XCTAssertEqual(voice.speechMs, 6200)
+        XCTAssertEqual(voice.provider, "modulate:velma-2-synthetic-voice-detection-streaming")
+        XCTAssertEqual(voice.detectedAt, 1_758_600_030_000)
+        XCTAssertEqual(voice.detectedDate, Date(timeIntervalSince1970: 1_758_600_030))
+        XCTAssertEqual(voice.updatedAt, 1_758_600_031_000)
+        XCTAssertEqual(voice.updatedDate, Date(timeIntervalSince1970: 1_758_600_031))
+        let alert = try XCTUnwrap(voice.alert)
+        XCTAssertEqual(alert.title, "AI voice detected")
+        XCTAssertEqual(alert.subtitle, "Call from +1 (415) 555-0134")
+        XCTAssertEqual(alert.body, CallFixtures.voiceAlertBody)
+        XCTAssertEqual(alert.sentDate, Date(timeIntervalSince1970: 1_758_600_031))
+        XCTAssertTrue(alert.pushed)
+        XCTAssertTrue(alert.spoken)
+
+        // Every status the relay sends has its own case; `unknown` is the app's, for a newer relay's.
+        XCTAssertEqual(VoiceStatus.allCases.map(\.rawValue), ["analyzing", "human", "synthetic", "inconclusive", "unavailable", "unknown"])
+        for status in VoiceStatus.allCases {
+            let decoded = try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(#"{"status": "\#(status.rawValue)"}"#))
+            XCTAssertEqual(decoded.status, status)
+        }
+
+        let roundTripped = try decoder.decode(CallVoiceAssessment.self, from: try JSONEncoder().encode(voice))
+        XCTAssertEqual(roundTripped, voice)
+    }
+
+    func testVoiceAssessmentDecodesLenientlyWithMissingOptionalsUnknownStatusAndWrongTypes() throws {
+        let minimal = try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(#"{"status": "analyzing"}"#))
+        XCTAssertEqual(minimal.status, .analyzing)
+        XCTAssertEqual(minimal.syntheticShare, 0)
+        XCTAssertEqual(minimal.confidence, 0)
+        XCTAssertEqual(minimal.speechMs, 0)
+        XCTAssertEqual(minimal.provider, "")
+        XCTAssertNil(minimal.detectedAt)
+        XCTAssertNil(minimal.detectedDate)
+        XCTAssertNil(minimal.alert)
+        XCTAssertEqual(minimal.updatedAt, 0)
+
+        let newer = try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(#"{"status": "robotic", "syntheticShare": 0.4, "futureField": {"x": 1}}"#))
+        XCTAssertEqual(newer.status, .unknown, "a status this app does not know never fails the decode")
+        XCTAssertEqual(newer.syntheticShare, 0.4, accuracy: 0.0001)
+
+        let empty = try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data("{}"))
+        XCTAssertEqual(empty.status, .unknown, "no status at all is unknown too")
+
+        let odd = try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(
+            #"{"status": 7, "syntheticShare": "high", "confidence": 3, "speechMs": -40, "provider": 12, "detectedAt": "soon", "alert": "sent", "updatedAt": 1758600031000.0}"#
+        ))
+        XCTAssertEqual(odd.status, .unknown)
+        XCTAssertEqual(odd.syntheticShare, 0, "not a number")
+        XCTAssertEqual(odd.confidence, 1, "clamped to 0…1")
+        XCTAssertEqual(odd.speechMs, 0, "never negative")
+        XCTAssertEqual(odd.provider, "")
+        XCTAssertNil(odd.detectedAt)
+        XCTAssertNil(odd.alert, "an alert that is not an object is no alert")
+        XCTAssertEqual(odd.updatedAt, 1_758_600_031_000, "a float timestamp is accepted")
+
+        let bareAlert = try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(#"{"status": "synthetic", "syntheticShare": -2, "alert": {}}"#))
+        XCTAssertEqual(bareAlert.syntheticShare, 0, "clamped to 0…1")
+        XCTAssertEqual(bareAlert.alert, CallVoiceAlert(title: "", subtitle: "", body: "", sentAt: 0, pushed: false, spoken: false), "an empty alert object is still an alert")
+        let nullAlert = try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(#"{"status": "synthetic", "alert": null, "detectedAt": null}"#))
+        XCTAssertNil(nullAlert.alert)
+
+        XCTAssertThrowsError(try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(#"["synthetic"]"#)), "an assessment is an object")
+    }
+
+    func testCallSummaryCarriesTheVoiceAssessmentNextToTheVerdict() throws {
+        let summary = try decoder.decode(CallSummary.self, from: CallFixtures.data(CallFixtures.summaryJSON(voice: CallFixtures.voiceJSON)))
+        XCTAssertEqual(summary.voice?.status, .synthetic)
+        XCTAssertNotNil(summary.voice?.alert)
+        XCTAssertEqual(summary.verdict?.level, .high, "the verdict is untouched")
+        XCTAssertTrue(summary.alerted)
+
+        // No detector ran: the relay leaves the key out.
+        let without = try decoder.decode(CallSummary.self, from: CallFixtures.data(CallFixtures.summaryJSON()))
+        XCTAssertNil(without.voice)
+
+        // The caller's voice is flagged before any transcript exists: a voice assessment and no verdict at all.
+        let voiceOnly = try decoder.decode(CallSummary.self, from: CallFixtures.data(CallFixtures.summaryJSON(status: "in_progress", withVerdict: false, voice: CallFixtures.voiceJSON)))
+        XCTAssertNil(voiceOnly.verdict)
+        XCTAssertEqual(voiceOnly.voice?.status, .synthetic)
+
+        // A voice value this app cannot read costs only itself, never the call or its verdict.
+        for unreadable in [#""yes""#, "[1, 2]", "7", "null"] {
+            let decoded = try decoder.decode(CallSummary.self, from: CallFixtures.data(CallFixtures.summaryJSON(voice: unreadable)))
+            XCTAssertNil(decoded.voice, unreadable)
+            XCTAssertEqual(decoded.callID, CallFixtures.callID)
+            XCTAssertEqual(decoded.verdict?.sequence, 3, unreadable)
+        }
+
+        let unknownStatus = try decoder.decode(CallSummary.self, from: CallFixtures.data(CallFixtures.summaryJSON(voice: #"{"status": "robotic"}"#)))
+        XCTAssertEqual(unknownStatus.voice?.status, .unknown)
+
+        // The detail route is the summary plus a transcript, so it carries the assessment the same way.
+        let detail = try decoder.decode(CallDetail.self, from: CallFixtures.data(CallFixtures.summaryJSON(voice: CallFixtures.voiceJSON)))
+        XCTAssertEqual(detail.summary.voice?.status, .synthetic)
+
+        let roundTripped = try decoder.decode(CallSummary.self, from: try JSONEncoder().encode(summary))
+        XCTAssertEqual(roundTripped, summary)
+    }
+
+    func testLiveEventDecodesVoiceUpdatedAndRejectsOneWithoutItsPayload() throws {
+        let event = try XCTUnwrap(LiveEvent.decode(#"{"type": "voice.updated", "callID": "\#(CallFixtures.callID)", "voice": \#(CallFixtures.voiceJSON)}"#))
+        guard case .voiceUpdated(let callID, let voice) = event else { return XCTFail("expected voice.updated, got \(event)") }
+        XCTAssertEqual(callID, CallFixtures.callID)
+        XCTAssertEqual(event.callID, CallFixtures.callID)
+        XCTAssertEqual(voice.status, .synthetic)
+        XCTAssertEqual(voice.alert?.title, "AI voice detected")
+
+        // A status from a newer relay is still an event; the views show nothing for it.
+        let newer = try LiveEvent.decode(#"{"type": "voice.updated", "callID": "x", "voice": {"status": "robotic"}}"#)
+        XCTAssertEqual(newer, .voiceUpdated(callID: "x", voice: CallVoiceAssessment(status: .unknown, syntheticShare: 0, confidence: 0, speechMs: 0, provider: "", updatedAt: 0)))
+
+        XCTAssertThrowsError(try LiveEvent.decode(#"{"type": "voice.updated", "callID": "x"}"#), "a known type without its payload") { error in
+            XCTAssertEqual(error as? LiveEvent.FrameError, .missingPayload("voice"))
+        }
+        XCTAssertThrowsError(try LiveEvent.decode(#"{"type": "voice.updated", "callID": "x", "voice": "synthetic"}"#), "a voice that is not an object is no payload") { error in
+            XCTAssertEqual(error as? LiveEvent.FrameError, .missingPayload("voice"))
+        }
+        XCTAssertThrowsError(try LiveEvent.decode(#"{"type": "voice.updated", "voice": \#(CallFixtures.voiceJSON)}"#), "no callID")
+
+        // A stray or unreadable `voice` key never costs another frame.
+        XCTAssertEqual(try LiveEvent.decode(#"{"type": "pong", "voice": 7}"#), .pong)
+        XCTAssertEqual(try LiveEvent.decode(#"{"type": "call.status", "callID": "x", "status": "ringing", "voice": "?"}"#), .callStatus(callID: "x", status: .ringing))
+
+        // The summaries inside hello / call.started / call.ended carry the assessment too.
+        let analyzing = #"{"status": "analyzing", "provider": "modulate:m", "updatedAt": 5}"#
+        let startedCall = CallFixtures.summaryJSON(status: "in_progress", alerted: false, withVerdict: false, voice: analyzing)
+        let started = try XCTUnwrap(LiveEvent.decode(#"{"type": "call.started", "call": \#(startedCall)}"#))
+        guard case .callStarted(let call) = started else { return XCTFail("expected call.started") }
+        XCTAssertEqual(call.voice?.status, .analyzing)
+        XCTAssertNil(call.verdict)
+    }
+
+    func testCallAlertPushPayloadReadsTheVoiceKey() throws {
+        let voicePush = CallFixtures.voicePushUserInfo()
+        let payload = try XCTUnwrap(CallAlertPushPayload.parse(voicePush))
+        XCTAssertEqual(payload.voice, .synthetic)
+        XCTAssertTrue(payload.isVoiceWarning)
+        XCTAssertEqual(payload.callID, CallFixtures.callID)
+        XCTAssertEqual(payload.callerNumber, "+14155550134")
+        XCTAssertEqual(payload.startedAt, Date(timeIntervalSince1970: 1_758_600_000))
+        XCTAssertEqual(payload.alertBody, CallFixtures.voiceAlertBody)
+        XCTAssertTrue(CallAlertPushPayload.isCallAlert(voicePush), "its own kind, the same route: never a mail scan")
+        XCTAssertEqual(RemoteNotificationRoute.classify(voicePush), .callAlert)
+
+        // The kind alone says what it is: a relay that left the `voice` key out, or sent one this app cannot
+        // read, is still delivering the AI-voice warning — never a scam alert.
+        var bare = voicePush
+        bare["voice"] = nil
+        XCTAssertTrue(try XCTUnwrap(CallAlertPushPayload.parse(bare)).isVoiceWarning)
+        bare["voice"] = "robotic"
+        XCTAssertTrue(try XCTUnwrap(CallAlertPushPayload.parse(bare)).isVoiceWarning)
+        bare["kind"] = " call-voice-alert "
+        XCTAssertEqual(RemoteNotificationRoute.classify(bare), .callAlert)
+        XCTAssertNil(CallAlertPushPayload.parse(["kind": "call-voice-alert"]), "no callID")
+
+        // The spelling this app also accepts: the scam alert's kind with `voice: "synthetic"` on it.
+        var legacy = voicePush
+        legacy["kind"] = "call-alert"
+        XCTAssertTrue(try XCTUnwrap(CallAlertPushPayload.parse(legacy)).isVoiceWarning)
+
+        // The scam alert has no such key and is read exactly as before.
+        let scam = try XCTUnwrap(CallAlertPushPayload.parse(CallFixtures.pushUserInfo()))
+        XCTAssertNil(scam.voice)
+        XCTAssertFalse(scam.isVoiceWarning)
+        XCTAssertEqual(scam.level, .high)
+
+        var odd = CallFixtures.pushUserInfo()
+        odd["voice"] = "robotic"
+        XCTAssertNil(try XCTUnwrap(CallAlertPushPayload.parse(odd)).voice, "an unknown value is no voice key")
+        odd["voice"] = "unknown"
+        XCTAssertNil(try XCTUnwrap(CallAlertPushPayload.parse(odd)).voice)
+        odd["voice"] = 1
+        XCTAssertNil(try XCTUnwrap(CallAlertPushPayload.parse(odd)).voice, "not a string")
+        odd["voice"] = " synthetic "
+        XCTAssertTrue(try XCTUnwrap(CallAlertPushPayload.parse(odd)).isVoiceWarning, "trimmed")
+        odd["voice"] = "human"
+        XCTAssertFalse(try XCTUnwrap(CallAlertPushPayload.parse(odd)).isVoiceWarning, "only synthetic is a warning")
+    }
+
+    func testVoicePresentationHelpers() {
+        XCTAssertEqual(VoiceStatus.analyzing.displayTitle, "Checking the caller's voice…")
+        XCTAssertEqual(VoiceStatus.human.displayTitle, "Voice sounds human")
+        XCTAssertEqual(VoiceStatus.synthetic.displayTitle, "AI voice detected")
+        for silent in [VoiceStatus.inconclusive, .unavailable, .unknown] {
+            XCTAssertNil(silent.displayTitle, "\(silent) shows nothing")
+        }
+        XCTAssertTrue(VoiceStatus.allCases.allSatisfy { !$0.symbolName.isEmpty })
+
+        XCTAssertEqual(CallVoiceDisplay.percent(0.874), 87)
+        XCTAssertEqual(CallVoiceDisplay.percent(1.7), 100)
+        XCTAssertEqual(CallVoiceDisplay.percent(-1), 0)
+        XCTAssertEqual(CallVoiceDisplay.percent(.nan), 0)
+        XCTAssertEqual(CallVoiceDisplay.shareText(0.87), "About 87% of the caller's speech sounded AI-generated.")
+        XCTAssertNil(CallVoiceDisplay.shareText(nil))
+        XCTAssertNil(CallVoiceDisplay.shareText(0.001), "a share that rounds to nothing is not shown")
+        XCTAssertEqual(CallVoiceDisplay.confidenceText(0.93), "Detector confidence: 93%.")
+        XCTAssertNil(CallVoiceDisplay.confidenceText(nil))
+        XCTAssertEqual(CallVoiceDisplay.measurement(share: 0.87, confidence: 0.93), "About 87% of the caller's speech sounded AI-generated. Detector confidence: 93%.")
+        XCTAssertEqual(CallVoiceDisplay.measurement(share: nil, confidence: 0.93), "Detector confidence: 93%.")
+        XCTAssertNil(CallVoiceDisplay.measurement(share: nil, confidence: nil), "a placeholder from the push alone has neither")
+        XCTAssertEqual(CallVoiceDisplay.liveMessage(share: 0), CallVoiceDisplay.liveDetail)
+        XCTAssertEqual(CallVoiceDisplay.liveMessage(share: 0.87), "This caller's voice appears to be AI-generated. About 87% of the caller's speech sounded AI-generated.")
+
+        XCTAssertEqual(CallVoiceDisplay.providerName(forIdentifier: "modulate:velma-2-synthetic-voice-detection-streaming"), "Modulate")
+        XCTAssertEqual(CallVoiceDisplay.providerName(forIdentifier: "other:model"), "other:model")
+        XCTAssertNil(CallVoiceDisplay.providerName(forIdentifier: nil))
+        XCTAssertNil(CallVoiceDisplay.providerName(forIdentifier: ""))
+        XCTAssertEqual(CallVoiceDisplay.footnote(status: .synthetic, provider: "modulate:m"), "The caller's voice was checked for AI-generated speech by Modulate.")
+        XCTAssertEqual(CallVoiceDisplay.footnote(status: .human, provider: nil), "The caller's voice was checked for AI-generated speech.")
+        XCTAssertTrue(CallVoiceDisplay.footnote(status: .synthetic, provider: "demo:scripted")?.contains("scripted demo") ?? false)
+        XCTAssertNil(CallVoiceDisplay.footnote(status: .unavailable, provider: "modulate:m"), "nothing was judged")
+        XCTAssertNil(CallVoiceDisplay.footnote(status: .inconclusive, provider: "modulate:m"))
+        XCTAssertNil(CallVoiceDisplay.footnote(status: nil, provider: nil), "no detector ran")
+
+        // A synthetic voice is not a scam: its wording never says so, and never replaces a scam call's own.
+        XCTAssertEqual(CallVoiceDisplay.rowSummary(summary: "The caller asks for gift cards.", level: .high, voiceStatus: .synthetic), "The caller asks for gift cards.")
+        // Listed only for the voice: the safe verdict's own summary would sit right under a warning.
+        XCTAssertEqual(CallVoiceDisplay.rowSummary(summary: "No signs of a scam so far.", level: .safe, voiceStatus: .synthetic), CallVoiceDisplay.listSummary)
+        XCTAssertEqual(CallVoiceDisplay.rowSummary(summary: "No signs of a scam so far.", level: .safe, voiceStatus: .human), "No signs of a scam so far.")
+        XCTAssertFalse(CallVoiceDisplay.noScamSigns.isEmpty)
+        XCTAssertFalse(CallVoiceDisplay.noScamVerdict.isEmpty)
+        XCTAssertEqual(CallVoiceDisplay.rowSummary(summary: "", level: .safe, voiceStatus: .synthetic), CallVoiceDisplay.listSummary)
+        XCTAssertEqual(CallVoiceDisplay.rowSummary(summary: "", level: .high, voiceStatus: .synthetic), CallAlertText.fallbackBody)
+        XCTAssertEqual(CallVoiceDisplay.rowSummary(summary: "", level: .safe, voiceStatus: .human), CallAlertText.fallbackBody)
+        XCTAssertEqual(CallVoiceDisplay.rowSummary(summary: "", level: .medium, voiceStatus: nil), CallAlertText.fallbackBody, "as before the voice check existed")
+        XCTAssertFalse(CallVoiceDisplay.listSummary.lowercased().contains("scam"))
+        XCTAssertFalse(CallVoiceDisplay.liveDetail.lowercased().contains("scam"))
+        XCTAssertTrue(CallVoiceDisplay.explanation.contains("does not prove the call was a scam"))
+
+        XCTAssertNil(CallVoiceDisplay.diagnostics(statusRaw: nil, share: nil, confidence: nil, provider: nil))
+        XCTAssertEqual(CallVoiceDisplay.diagnostics(statusRaw: "unavailable", share: nil, confidence: nil, provider: ""), "AI voice check: unavailable")
+        XCTAssertEqual(
+            CallVoiceDisplay.diagnostics(statusRaw: "synthetic", share: 0.87, confidence: 0.93, provider: "modulate:m"),
+            "AI voice check: synthetic (synthetic share 87%, confidence 93%, modulate:m)"
+        )
     }
 
     // MARK: - Presentation helpers
