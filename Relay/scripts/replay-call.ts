@@ -9,7 +9,8 @@
  *   npm run calls:replay -- call.wav --device <deviceID> …        (a registered device without a line, e.g. no Twilio)
  *
  * `--base` and `--key` default to PUBLIC_BASE_URL and RELAY_API_KEY from Relay/.env (the npm script loads it).
- * The relay needs OPENAI_API_KEY: the audio goes to the OpenAI transcriber (503 openai_not_configured otherwise).
+ * The relay needs OPENAI_API_KEY (the audio goes to the OpenAI transcriber) or MODULATE_API_KEY (the caller's
+ * channel goes to the AI-voice detector), or both; with neither it answers 503 openai_not_configured.
  * Nothing here needs ffmpeg: WAV parsing, resampling to 8 kHz and G.711 μ-law encoding are in src/calls/audio.ts.
  */
 
@@ -75,7 +76,7 @@ function parseArgs(argv: string[]): Args {
 function refusalHint(error: string | undefined): string {
   switch (error) {
     case "openai_not_configured":
-      return " — a replay needs OPENAI_API_KEY on the relay (scripted demos do not: use the console's Start demo call)";
+      return " — a replay needs OPENAI_API_KEY or MODULATE_API_KEY on the relay (scripted demos do not: use the console's Start demo call)";
     case "unknown_device":
       return " — no device with that id is registered on the relay (the console page lists them)";
     case "no_line":

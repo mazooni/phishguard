@@ -84,7 +84,7 @@ struct CallSetupView: View {
                 } header: {
                     Text("Warn when")
                 } footer: {
-                    Text("Every call is still checked; calls below this level are neither listed nor notified.")
+                    Text("Every call is still checked; calls below this level are neither listed nor notified — except a call whose caller's voice is judged AI-generated, which is always reported when the relay checks for that.")
                 }
 
                 Section {
@@ -97,19 +97,20 @@ struct CallSetupView: View {
                         }
                     }
                 } footer: {
-                    Text("\"This is PhishGuard. This call shows signs of a scam. Do not share codes, card numbers or passwords, and do not buy gift cards. It is safe to hang up now.\" The urgent notification on this phone is sent either way.")
+                    Text("\"This is PhishGuard. This call shows signs of a scam. Do not share codes, card numbers or passwords, and do not buy gift cards. It is safe to hang up now.\" The urgent notification on this phone is sent either way. This switch also covers the separate warning about an AI-generated voice, when the relay checks for one.")
                 }
 
                 Section {
                     step(1, "Give people the guard number instead of your own. Calls to it ring your phone as usual.")
                     step(2, "While you talk, the call is transcribed and checked for scam patterns as it happens.")
                     step(3, "If it looks like a scam you get an urgent notification — and, if turned on, the spoken warning.")
+                    step(4, "If the relay has AI-voice detection turned on, the caller's voice is also checked for AI-generated speech. If it sounds AI-generated you get a separate notification and, with the spoken warning on, may hear a second warning. An AI voice alone does not mean the call is a scam.")
                     HStack(alignment: .top, spacing: 12) {
                         Image(systemName: "lock.shield")
                             .foregroundStyle(.tint)
                             .frame(width: 24)
                             .accessibilityHidden(true)
-                        Text("The call audio is processed by the PhishGuard relay and OpenAI to do this. The relay keeps only the numbers, the times and the verdict — never the transcript.")
+                        Text("The call audio is processed by the PhishGuard relay and OpenAI to do this. When the relay has AI-voice detection turned on, the caller's side of the audio is also checked by Modulate for AI-generated speech, and a second spoken warning may play. The relay keeps only the numbers, the times, the verdict and the result of that voice check — never the transcript.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

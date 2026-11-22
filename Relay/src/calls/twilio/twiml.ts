@@ -101,9 +101,18 @@ export interface ForkInput {
   source: ResolvedTranscriptionSource;
   publicBaseUrl: string;
   transcribeTracks: "both" | "caller";
+  /**
+   * AI-voice detection needs the caller's audio. Source `openai` already streams the caller's track (in both
+   * `transcribeTracks` modes); source `twilio` has no Media Stream at all, so `true` adds a caller-only one.
+   */
+  voiceStream?: boolean | undefined;
 }
 
-/** The `<Start>` block: a Media Streams fork (source `openai`) or Twilio's own `<Transcription>` (source `twilio`). */
+/**
+ * The `<Start>` block: a Media Streams fork (source `openai`) or Twilio's own `<Transcription>` (source `twilio`),
+ * the latter followed by a second `<Start>` with a caller-only `<Stream>` when `voiceStream` is set. Twilio
+ * documents a shared limit of four audio forks per call: `<Transcription>` on both tracks uses two, this adds one.
+ */
 function addFork(response: VoiceResponse, input: ForkInput): void {
   const { session, publicBaseUrl } = input;
   const start = response.start();
@@ -127,6 +136,14 @@ function addFork(response: VoiceResponse, input: ForkInput): void {
     inboundTrackLabel: speakers.inbound,
     outboundTrackLabel: speakers.outbound,
   });
+  if (input.voiceStream !== true) return;
+  const voice = response.start().stream({
+    url: mediaStreamUrl(publicBaseUrl, session),
+    track: streamTrack(session.source, "caller"),
+    statusCallback: callbackUrl(publicBaseUrl, "stream", session),
+    statusCallbackMethod: "POST",
+  });
+  voice.parameter({ name: "callID", value: session.callId });
 }
 
 function streamTrack(source: CallSource, tracks: "both" | "caller"): StreamTrack {

@@ -257,6 +257,15 @@ later verdicts warn again only when the level rises:
    is PhishGuard. This call shows signs of a scam. Do not share codes, card numbers or passwords..."* The caller
    never hears it. It can be turned off per line.
 
+**AI-voice (deepfake) detection, optional.** Call Guard can also warn you when the caller's voice sounds
+AI-generated. With a Modulate API key on the relay (`MODULATE_API_KEY`), the caller's side of the audio, never
+yours, is also streamed to Modulate's streaming Deepfake Detection API. When most of the caller's recent speech is
+judged synthetic you get one more warning, once per call: an *AI voice detected* push and a spoken announcement
+only you hear. It is kept apart from the scam verdict and never changes the scam score, because a synthetic voice
+is not proof of a scam and the detector can be wrong in both directions. Without the key nothing is sent to
+Modulate and Call Guard works exactly as before. It needs a full (non-trial) Twilio account; the settings are in
+`Relay/.env.example`, and `npm run calls:voice-check -- caller.wav` checks a key against a recording.
+
 **The live console.** The Calls tab shows the call as it happens: a risk gauge, status and elapsed time, the top
 reasons, the recommended action, and the last transcript lines (partial ones in italics), fed over a WebSocket from
 the relay. The relay also serves an operator console page that shows every line's calls the same way, behind a key

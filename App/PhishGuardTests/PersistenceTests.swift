@@ -181,6 +181,152 @@ final class PersistenceTests: XCTestCase {
         XCTAssertFalse(calls.first?.isDemo ?? true)
     }
 
+    // MARK: - AI-voice fields on FlaggedCallRecord
+
+    @MainActor
+    func testFlaggedCallRecordStoresTheVoiceAssessmentAndDefaultsToNil() throws {
+        let container = try Persistence.makeContainer(inMemory: true)
+        let context = container.mainContext
+        let decoder = JSONDecoder()
+
+        // A call no AI-voice detector ran on: every voice field is nil, as on every record before the check existed.
+        let plainSummary = try decoder.decode(CallSummary.self, from: CallFixtures.data(CallFixtures.summaryJSON(callID: CallFixtures.secondCallID)))
+        context.insert(try XCTUnwrap(FlaggedCallRecord(summary: plainSummary)))
+        // A call flagged synthetic before any verdict existed.
+        let voiceOnly = try decoder.decode(CallSummary.self, from: CallFixtures.data(CallFixtures.summaryJSON(alerted: false, withVerdict: false, voice: CallFixtures.voiceJSON)))
+        context.insert(try XCTUnwrap(FlaggedCallRecord(summary: voiceOnly), "a voice-only summary is storable"))
+        try context.save()
+
+        let stored = try context.fetch(FetchDescriptor<FlaggedCallRecord>())
+        XCTAssertEqual(stored.count, 2)
+        let plain = try XCTUnwrap(stored.first { $0.id == UUID(uuidString: CallFixtures.secondCallID) })
+        XCTAssertNil(plain.voiceStatusRaw)
+        XCTAssertNil(plain.voiceStatus)
+        XCTAssertNil(plain.voiceSyntheticShare)
+        XCTAssertNil(plain.voiceConfidence)
+        XCTAssertNil(plain.voiceProvider)
+        XCTAssertEqual(plain.level, .high)
+
+        let flagged = try XCTUnwrap(stored.first { $0.id == UUID(uuidString: CallFixtures.callID) })
+        XCTAssertEqual(flagged.voiceStatusRaw, "synthetic")
+        XCTAssertEqual(flagged.voiceStatus, .synthetic)
+        XCTAssertEqual(try XCTUnwrap(flagged.voiceSyntheticShare), 0.87, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(flagged.voiceConfidence), 0.93, accuracy: 0.0001)
+        XCTAssertEqual(flagged.voiceProvider, "modulate:velma-2-synthetic-voice-detection-streaming")
+        XCTAssertTrue(flagged.alerted, "the assessment carries the warning, whatever the summary's flag says")
+        // Neutral verdict fields: the voice check never becomes a scam verdict.
+        XCTAssertEqual(flagged.level, .safe)
+        XCTAssertEqual(flagged.category, .safe)
+        XCTAssertEqual(flagged.confidence, 0)
+        XCTAssertTrue(flagged.reasons.isEmpty)
+        XCTAssertEqual(flagged.summary, "")
+        XCTAssertEqual(flagged.recommendedAction, "")
+
+        // A later report of the plain call brings an assessment: the row takes it and keeps its verdict.
+        let human = try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(#"{"status": "human", "syntheticShare": 0.02, "confidence": 0.96, "speechMs": 9000, "provider": "modulate:m", "updatedAt": 1}"#))
+        var reported = plainSummary
+        reported.voice = human
+        reported.alerted = false
+        plain.alerted = false
+        plain.update(from: reported)
+        XCTAssertEqual(plain.voiceStatus, .human)
+        XCTAssertEqual(try XCTUnwrap(plain.voiceConfidence), 0.96, accuracy: 0.0001)
+        XCTAssertEqual(plain.level, .high)
+        XCTAssertEqual(plain.reasons.count, 3)
+        XCTAssertFalse(plain.alerted, "an assessment without a warning alerts nobody")
+
+        // A report without an assessment (an older relay, the detector turned off) keeps what is stored.
+        reported.voice = nil
+        plain.update(from: reported)
+        XCTAssertEqual(plain.voiceStatus, .human)
+        XCTAssertFalse(plain.alerted)
+
+        // `voice.updated` on its own, with the warning: only the voice fields and `alerted` change.
+        plain.apply(try decoder.decode(CallVoiceAssessment.self, from: CallFixtures.data(CallFixtures.voiceJSON)))
+        XCTAssertEqual(plain.voiceStatus, .synthetic)
+        XCTAssertTrue(plain.alerted)
+        XCTAssertEqual(plain.level, .high)
+        XCTAssertEqual(plain.summary, "The caller claims to be a grandchild in trouble and asks for gift cards.")
+
+        // The warning push alone: synthetic, without figures that belonged to another status.
+        plain.apply(human)
+        plain.markVoiceSynthetic()
+        XCTAssertEqual(plain.voiceStatus, .synthetic)
+        XCTAssertNil(plain.voiceSyntheticShare)
+        XCTAssertNil(plain.voiceConfidence)
+        flagged.markVoiceSynthetic()
+        XCTAssertEqual(try XCTUnwrap(flagged.voiceSyntheticShare), 0.87, accuracy: 0.0001, "already synthetic: left as it is")
+
+        // A status from a newer relay is stored as it came and read as unknown, which every view shows nothing for.
+        plain.voiceStatusRaw = "robotic"
+        XCTAssertEqual(plain.voiceStatus, .unknown)
+        try context.save()
+        XCTAssertEqual(try context.fetch(FetchDescriptor<FlaggedCallRecord>()).count, 2)
+    }
+
+    /// A store written **before** the AI-voice attributes existed on `FlaggedCallRecord` must open with the
+    /// shipping schema and keep its calls, with every voice attribute nil — the upgrade an installed phone
+    /// performs. The four attributes are additive optionals with a nil default, which Core Data can infer a
+    /// mapping for, so no migration plan is needed (the `isDemo` precedent above). `PreVoiceSchema` below is
+    /// the call entity as it stood before; the three mail entities are the shipping ones.
+    @MainActor
+    func testStoreFromBeforeTheVoiceCheckMigratesAndDefaultsToNil() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("PhishGuardVoiceMigration-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("PhishGuard.store")
+
+        let callID = try XCTUnwrap(UUID(uuidString: CallFixtures.callID))
+        do {
+            let schema = Schema([LinkedAccount.self, FlaggedEmailRecord.self, ProcessedMessage.self, PreVoiceSchema.FlaggedCallRecord.self])
+            // The legacy copy must be the same entity as the shipping call model, or this would test nothing.
+            XCTAssertEqual(Set(schema.entities.map(\.name)), Set(Persistence.schema.entities.map(\.name)))
+            let container = try ModelContainer(for: schema, configurations: [ModelConfiguration(schema: schema, url: url)])
+            let context = ModelContext(container)
+            let reasons = [Reason(id: "call.gift_cards", title: "Asks for gift cards", detail: "Caller: \"go buy four $500 cards\"", severity: .high, source: .heuristic)]
+            context.insert(PreVoiceSchema.FlaggedCallRecord(
+                id: callID, callerNumber: "+14155550134", guardNumber: "+16285550199",
+                startedAt: Date(timeIntervalSince1970: 1_758_600_000), endedAt: Date(timeIntervalSince1970: 1_758_600_254), durationSeconds: 254,
+                statusRaw: "completed", sourceRaw: "twilio", categoryRaw: "scam", confidence: 0.92, levelRaw: "high",
+                reasonsJSON: (try? JSONEncoder().encode(reasons)) ?? Data("[]".utf8),
+                summary: "The caller asks for gift cards.", recommendedAction: "Hang up.", modelIdentifier: "openai:gpt-4.1-mini",
+                alerted: true, isRead: true, isDemo: false
+            ))
+            try context.save()
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+
+        let container = try ModelContainer(
+            for: Persistence.schema,
+            configurations: [ModelConfiguration(schema: Persistence.schema, url: url)]
+        )
+        let context = ModelContext(container)
+
+        let calls = try context.fetch(FetchDescriptor<FlaggedCallRecord>())
+        XCTAssertEqual(calls.map(\.id), [callID], "the call written by the older schema is still there")
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.callerNumber, "+14155550134")
+        XCTAssertEqual(call.level, .high)
+        XCTAssertEqual(call.category, .scam)
+        XCTAssertEqual(call.durationSeconds, 254)
+        XCTAssertEqual(call.reasons.map(\.id), ["call.gift_cards"])
+        XCTAssertEqual(call.modelIdentifier, "openai:gpt-4.1-mini")
+        XCTAssertTrue(call.alerted)
+        XCTAssertTrue(call.isRead)
+        XCTAssertFalse(call.isDemo)
+        XCTAssertNil(call.voiceStatusRaw, "a call from before the voice check was never checked")
+        XCTAssertNil(call.voiceStatus)
+        XCTAssertNil(call.voiceSyntheticShare)
+        XCTAssertNil(call.voiceConfidence)
+        XCTAssertNil(call.voiceProvider)
+
+        // And the migrated row takes an assessment like any other.
+        call.apply(try JSONDecoder().decode(CallVoiceAssessment.self, from: CallFixtures.data(CallFixtures.voiceJSON)))
+        try context.save()
+        XCTAssertEqual(try context.fetch(FetchDescriptor<FlaggedCallRecord>()).first?.voiceStatus, .synthetic)
+    }
+
     /// Writes the store with `PreIsDemoSchema` and lets the container go out of scope before the caller reopens
     /// the same file with the shipping schema.
     @MainActor
@@ -313,6 +459,59 @@ enum PreIsDemoSchema {
         init(key: String, processedAt: Date) {
             self.key = key
             self.processedAt = processedAt
+        }
+    }
+}
+
+/// `FlaggedCallRecord` exactly as it was before the AI-voice attributes were added, used only to write a store
+/// that predates them. Nested for the same reason as `PreIsDemoSchema`: SwiftData still registers it under the
+/// entity name `FlaggedCallRecord`, which `testStoreFromBeforeTheVoiceCheckMigratesAndDefaultsToNil` pins.
+enum PreVoiceSchema {
+    @Model
+    final class FlaggedCallRecord {
+        @Attribute(.unique) var id: UUID
+        var callerNumber: String
+        var guardNumber: String
+        var startedAt: Date
+        var endedAt: Date?
+        var durationSeconds: Int?
+        var statusRaw: String
+        var sourceRaw: String
+        var categoryRaw: String
+        var confidence: Double
+        var levelRaw: String
+        var reasonsJSON: Data
+        var summary: String
+        var recommendedAction: String
+        var modelIdentifier: String?
+        var alerted: Bool
+        var isRead: Bool
+        var isDemo: Bool = false
+
+        init(
+            id: UUID, callerNumber: String, guardNumber: String, startedAt: Date, endedAt: Date?, durationSeconds: Int?,
+            statusRaw: String, sourceRaw: String, categoryRaw: String, confidence: Double, levelRaw: String,
+            reasonsJSON: Data, summary: String, recommendedAction: String, modelIdentifier: String?, alerted: Bool,
+            isRead: Bool, isDemo: Bool
+        ) {
+            self.id = id
+            self.callerNumber = callerNumber
+            self.guardNumber = guardNumber
+            self.startedAt = startedAt
+            self.endedAt = endedAt
+            self.durationSeconds = durationSeconds
+            self.statusRaw = statusRaw
+            self.sourceRaw = sourceRaw
+            self.categoryRaw = categoryRaw
+            self.confidence = confidence
+            self.levelRaw = levelRaw
+            self.reasonsJSON = reasonsJSON
+            self.summary = summary
+            self.recommendedAction = recommendedAction
+            self.modelIdentifier = modelIdentifier
+            self.alerted = alerted
+            self.isRead = isRead
+            self.isDemo = isDemo
         }
     }
 }

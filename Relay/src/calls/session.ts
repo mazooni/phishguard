@@ -3,6 +3,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 
 import {
   ENDED_STATUSES,
+  clamp01,
   truncate,
   type AlertLevel,
   type CallAlert,
@@ -12,6 +13,9 @@ import {
   type CallStatus,
   type CallSummaryJSON,
   type CallVerdict,
+  type CallVoiceAlert,
+  type CallVoiceAssessment,
+  type CallVoiceUpdate,
   type TranscriptSegment,
 } from "./types.js";
 
@@ -20,7 +24,7 @@ import {
  * the Twilio path and the demo runner feed it status and transcript segments, the detector sets verdicts, the
  * alert dispatcher records alerts, the live hub relays everything, and the manager persists `toRecord()`.
  *
- * Events (typed): `status`, `segment`, `verdict`, `alert`, `ended`. Transcripts live here in memory only.
+ * Events (typed): `status`, `segment`, `verdict`, `alert`, `voice`, `ended`. Transcripts live here in memory only.
  */
 
 export interface CallSessionEvents {
@@ -28,6 +32,8 @@ export interface CallSessionEvents {
   segment: [segment: TranscriptSegment];
   verdict: [verdict: CallVerdict];
   alert: [alert: CallAlert];
+  /** The AI-voice assessment of the caller changed (or its warning was recorded). */
+  voice: [voice: CallVoiceAssessment];
   ended: [record: CallRecord];
 }
 
@@ -74,6 +80,7 @@ export class CallSession extends EventEmitter<CallSessionEvents> {
   private _verdict: CallVerdict | undefined;
   private _sequence = 0;
   private readonly _alerts: CallAlert[] = [];
+  private _voice: CallVoiceAssessment | undefined;
   private readonly _segments: TranscriptSegment[] = [];
   private _updatedAt: number;
   private readonly now: () => number;
@@ -115,8 +122,14 @@ export class CallSession extends EventEmitter<CallSessionEvents> {
     return this._alerts;
   }
 
+  /** True once the person was warned about this call: a scam alert, or the AI-voice warning. */
   get alerted(): boolean {
-    return this._alerts.length > 0;
+    return this._alerts.length > 0 || this._voice?.alert !== undefined;
+  }
+
+  /** The AI-voice assessment of the caller; undefined when no detector ran on this call. */
+  get voice(): CallVoiceAssessment | undefined {
+    return this._voice;
   }
 
   /** The highest level alerted so far. */
@@ -190,12 +203,65 @@ export class CallSession extends EventEmitter<CallSessionEvents> {
     this.emit("alert", alert);
   }
 
+  /**
+   * Stores what the synthetic-voice detector reports and emits `voice` when something the person would notice
+   * changed (status, share or confidence to 2 dp). `synthetic` is sticky: once the caller's voice was judged
+   * AI-generated, a later report cannot take it back (the share and confidence still update). Nothing is accepted
+   * after the session ended. Returns the stored assessment.
+   */
+  setVoice(update: CallVoiceUpdate): CallVoiceAssessment | undefined {
+    if (this.isEnded) return this._voice;
+    const previous = this._voice;
+    const at = this.now();
+    const status = previous?.status === "synthetic" ? "synthetic" : update.status;
+    const next: CallVoiceAssessment = {
+      status,
+      syntheticShare: clamp01(update.syntheticShare),
+      confidence: clamp01(update.confidence),
+      speechMs: Math.max(0, Math.round(update.speechMs)),
+      provider: update.provider,
+      updatedAt: at,
+    };
+    const detectedAt = previous?.detectedAt ?? (status === "synthetic" ? at : undefined);
+    if (detectedAt !== undefined) next.detectedAt = detectedAt;
+    if (previous?.alert) next.alert = previous.alert;
+    if (
+      previous &&
+      previous.status === next.status &&
+      previous.syntheticShare.toFixed(2) === next.syntheticShare.toFixed(2) &&
+      previous.confidence.toFixed(2) === next.confidence.toFixed(2)
+    ) {
+      // Nothing visible changed: keep the counters fresh without an event (or a database write).
+      this._voice = { ...next, updatedAt: previous.updatedAt };
+      return this._voice;
+    }
+    this._voice = next;
+    this._updatedAt = at;
+    this.emit("voice", next);
+    return next;
+  }
+
+  /**
+   * Records the call's one AI-voice warning on the assessment and emits `voice`; a second call replaces it (the
+   * spoken part may be confirmed after the push). Like `recordAlert`, it is accepted after the call ended so a
+   * warning that was already sent is never lost from the record. Ignored without an assessment.
+   */
+  recordVoiceAlert(alert: CallVoiceAlert): void {
+    if (!this._voice) return;
+    this._voice = { ...this._voice, alert, updatedAt: this.now() };
+    this._updatedAt = this._voice.updatedAt;
+    this.emit("voice", this._voice);
+  }
+
   /** Idempotent. Emits `ended` exactly once with the final record. */
   end(status: CallStatus = "completed", at: number = this.now()): void {
     if (this.isEnded) return;
     this._status = ENDED_STATUSES.has(status) ? status : "completed";
     this._endedAt = at;
     this._updatedAt = at;
+    // A call that ended before the detector heard enough speech is inconclusive, not "still analysing"; the
+    // final record and the `call.ended` summary carry it (no separate `voice` event).
+    if (this._voice?.status === "analyzing") this._voice = { ...this._voice, status: "inconclusive", updatedAt: at };
     this.emit("ended", this.toRecord());
   }
 
@@ -255,6 +321,7 @@ export class CallSession extends EventEmitter<CallSessionEvents> {
     const level = this.alertLevel;
     if (level) record.alertLevel = level;
     if (this.twilioCallSid) record.twilioCallSid = this.twilioCallSid;
+    if (this._voice) record.voice = this._voice;
     return record;
   }
 
@@ -281,6 +348,7 @@ export function recordToSummaryJSON(record: CallRecord, now: number = Date.now()
   }
   if (record.verdict) summary.verdict = record.verdict;
   if (record.alertLevel) summary.alertLevel = record.alertLevel;
+  if (record.voice) summary.voice = record.voice;
   return summary;
 }
 
@@ -361,6 +429,7 @@ export class CallSessionManager extends EventEmitter<CallSessionManagerEvents> {
     session.on("status", () => persist("status"));
     session.on("verdict", () => persist("verdict"));
     session.on("alert", () => persist("alert"));
+    session.on("voice", () => persist("voice"));
     session.on("ended", () => {
       persist("ended");
       this.scheduleEviction(session);

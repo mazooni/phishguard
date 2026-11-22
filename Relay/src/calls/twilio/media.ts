@@ -1,7 +1,7 @@
 import type { FastifyBaseLogger } from "fastify";
 
 import type { CallSession } from "../session.js";
-import type { Speaker, Transcriber, TranscriberHandle } from "../types.js";
+import type { Speaker, Transcriber, TranscriberHandle, VoiceDetector, VoiceDetectorHandle } from "../types.js";
 import { speakerForTrack } from "./twiml.js";
 
 /**
@@ -10,6 +10,10 @@ import { speakerForTrack } from "./twiml.js";
  * `mark`, `dtmf`, `stop`. Unknown events are ignored. Audio is forwarded frame by frame to one transcriber handle
  * per track — nothing is buffered here — and the outbound track of an inbound call is dropped until the
  * protected person has joined (before that it is only the ringback the caller hears).
+ *
+ * With a voice detector, the CALLER's track is also fed to one voice handle per stream, whoever transcribes the
+ * call (it is the only consumer of the caller-only stream a Twilio-transcribed call gets). The protected
+ * person's track never reaches it.
  */
 
 export interface MediaStart {
@@ -95,8 +99,16 @@ export interface MediaConnectionOptions {
   transcriber: Transcriber | undefined;
   transcribeTracks: "both" | "caller";
   logger: FastifyBaseLogger;
+  /** AI-voice detection on the caller's track; absent (no `MODULATE_API_KEY`) changes nothing here. */
+  voiceDetector?: VoiceDetector | undefined;
+  /**
+   * Stops this stream at Twilio (`TwilioClient.stopStream`). Used only for a stream that feeds nothing but the
+   * voice detector, once the detector has finished with the call; absent for replays and tests without Twilio.
+   */
+  stopStream?: ((callSid: string, streamSid: string) => Promise<boolean>) | undefined;
 }
 
+/** `forwarded` and `dropped` count the transcriber path only; audio for the voice detector is not counted. */
 export interface MediaStats {
   frames: number;
   forwarded: number;
@@ -110,8 +122,14 @@ export const CLOSE_POLICY_VIOLATION = 1008;
 export class MediaConnection {
   readonly stats: MediaStats = { frames: 0, forwarded: 0, dropped: 0, invalid: 0 };
   private readonly handles = new Map<Speaker, TranscriberHandle>();
+  /** The caller's audio into the voice detector; opened on `start` when the stream carries the caller's track. */
+  private voiceHandle: VoiceDetectorHandle | undefined;
   private readonly session: CallSession;
   private readonly transcriber: Transcriber | undefined;
+  private readonly voiceDetector: VoiceDetector | undefined;
+  private readonly stopStream: ((callSid: string, streamSid: string) => Promise<boolean>) | undefined;
+  /** Twilio's identifiers for this stream, from its `start` message. */
+  private twilioStream: { callSid: string; streamSid: string } | undefined;
   private readonly transcribeTracks: "both" | "caller";
   private readonly logger: FastifyBaseLogger;
   private started = false;
@@ -126,6 +144,8 @@ export class MediaConnection {
     this.transcriber = options.transcriber;
     this.transcribeTracks = options.transcribeTracks;
     this.logger = options.logger;
+    this.voiceDetector = options.voiceDetector;
+    this.stopStream = options.stopStream;
   }
 
   get isClosed(): boolean {
@@ -186,15 +206,18 @@ export class MediaConnection {
       return;
     }
     this.started = true;
+    if (start.callSid && start.streamSid) this.twilioStream = { callSid: start.callSid, streamSid: start.streamSid };
+    const tracks = start.tracks && start.tracks.length > 0 ? start.tracks : ["inbound", "outbound"];
+    this.openVoice(tracks);
     if (this.session.transcriptionSource === "twilio") {
-      this.logger.warn({ callId: this.session.callId }, "calls: media stream on a session Twilio transcribes; audio ignored");
+      // With a voice handle this is the caller-only stream added for it; nothing here is for a transcriber.
+      if (!this.voiceHandle) this.logger.warn({ callId: this.session.callId }, "calls: media stream on a session Twilio transcribes; audio ignored");
       return;
     }
     if (!this.transcriber) {
-      this.logger.warn({ callId: this.session.callId }, "calls: media stream without a transcriber; audio ignored");
+      if (!this.voiceHandle) this.logger.warn({ callId: this.session.callId }, "calls: media stream without a transcriber; audio ignored");
       return;
     }
-    const tracks = start.tracks && start.tracks.length > 0 ? start.tracks : ["inbound", "outbound"];
     for (const track of tracks) {
       const speaker = speakerForTrack(this.session.source, track);
       if (!speaker || this.handles.has(speaker)) continue;
@@ -207,12 +230,49 @@ export class MediaConnection {
     );
   }
 
+  /** One voice handle for the caller's track (a test call swaps the tracks, hence `speakerForTrack`). */
+  private openVoice(tracks: string[]): void {
+    if (!this.voiceDetector || this.voiceHandle) return;
+    if (!tracks.some((track) => speakerForTrack(this.session.source, track) === "caller")) return;
+    try {
+      this.voiceHandle = this.voiceDetector.open(this.session);
+    } catch (error) {
+      // Voice detection is an extra: failing to start it must never cost the call its transcription.
+      this.logger.warn(
+        { errorName: error instanceof Error ? error.name : "unknown", callId: this.session.callId },
+        "calls: voice detector could not be opened",
+      );
+      return;
+    }
+    this.logger.info({ callId: this.session.callId }, "calls: media stream feeds the voice detector with the caller's track");
+    const handle = this.voiceHandle;
+    // Deferred past `start()`, which opens the transcriber handles after this: only then is it known whether the
+    // stream serves anything else.
+    void handle.finished?.then(() => this.voiceFinished(handle));
+  }
+
+  /**
+   * The detector is done with this call. A stream that exists for it alone (the caller-only fork added to a call
+   * Twilio transcribes) would otherwise run, unused, until the call ends: ask Twilio to stop it. Twilio then sends
+   * `stop` and closes the socket, which is the ordinary end of a stream. A stream that also feeds a transcriber is
+   * left alone, and so is everything when Twilio cannot be asked.
+   */
+  private voiceFinished(handle: VoiceDetectorHandle): void {
+    if (this.closed || this.voiceHandle !== handle || this.handles.size > 0) return;
+    if (!this.stopStream || !this.twilioStream || this.session.isEnded) return;
+    const { callSid, streamSid } = this.twilioStream;
+    this.logger.info({ callId: this.session.callId }, "calls: voice detector finished; stopping its media stream");
+    this.stopStream(callSid, streamSid).catch(() => false);
+  }
+
   private media(track: string, payload: string): void {
     if (!this.started) {
       this.stats.dropped += 1;
       return;
     }
     const speaker = speakerForTrack(this.session.source, track);
+    // Independent of the transcriber below. Only ever the caller: the protected person's voice is not analysed.
+    if (speaker === "caller") this.voiceHandle?.pushAudio(payload);
     const handle = speaker ? this.handles.get(speaker) : undefined;
     if (!speaker || !handle || this.shouldDrop(speaker)) {
       this.stats.dropped += 1;
@@ -247,6 +307,16 @@ export class MediaConnection {
       });
     }
     this.handles.clear();
+    if (this.voiceHandle) {
+      this.voiceHandle.close().catch((error: unknown) => {
+        // Fields only: a vendor error object can carry its connection URL.
+        this.logger.warn(
+          { errorName: error instanceof Error ? error.name : "unknown", callId: this.session.callId },
+          "calls: voice detector handle close failed",
+        );
+      });
+      this.voiceHandle = undefined;
+    }
     try {
       this.socket.close(code, reason);
     } catch {

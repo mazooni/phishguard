@@ -19,9 +19,32 @@ export interface OpenAIConfig {
   scoringModel: string;
 }
 
+/**
+ * AI-voice (synthetic speech) detection on the caller's audio, through Modulate's streaming Deepfake Detection
+ * API. Present only when `MODULATE_API_KEY` is set; without it nothing about a call changes.
+ */
+export interface VoiceDetectionConfig {
+  /** `MODULATE_API_KEY`. Travels in the WebSocket URL's query string (Modulate's only scheme): never log the URL. */
+  apiKey: string;
+  /** `CALLS_AI_VOICE_WINDOW_MS`: how much of the caller's most recent speech a decision is based on. */
+  windowMs: number;
+  /** `CALLS_AI_VOICE_MIN_SHARE_PERCENT` / 100: the share of that window that must be judged synthetic. */
+  minShare: number;
+  /** `CALLS_AI_VOICE_MIN_CONFIDENCE_PERCENT` / 100: a synthetic frame counts only at or above this confidence. */
+  minConfidence: number;
+  /** `CALLS_AI_VOICE_MAX_SECONDS` × 1000: caller audio streamed to the vendor per call at most; 0 = the whole call. */
+  maxStreamMs: number;
+  /** `CALLS_AI_VOICE_SPOKEN_WARNING`: speak the AI-voice warning into the call (the line's own `spokenWarning` must allow it too). */
+  spokenWarning: boolean;
+  /** `CALLS_AI_VOICE_WARNING_TEXT`. */
+  warningText: string;
+}
+
 export interface CallsConfig {
   twilio: TwilioConfig | undefined;
   openai: OpenAIConfig | undefined;
+  /** AI-voice detection; `undefined` (no `MODULATE_API_KEY`) leaves Call Guard exactly as it is without it. */
+  voice: VoiceDetectionConfig | undefined;
   transcribeTracks: "both" | "caller";
   /** `auto` resolves to `twilio` on a Trial account or without an OpenAI key, else `openai`. */
   transcriptionSource: TranscriptionSource;
@@ -40,6 +63,18 @@ export interface CallsConfig {
 export const DEFAULT_SPOKEN_WARNING =
   "This is PhishGuard. This call shows signs of a scam. Do not share codes, card numbers or passwords, " +
   "and do not buy gift cards. It is safe to hang up now.";
+
+/** Spoken to the protected person only, once per call, when the caller's voice is judged AI-generated. */
+export const DEFAULT_AI_VOICE_WARNING =
+  "This is PhishGuard. The caller's voice appears to be A.I. generated. If they say they are someone you know, " +
+  "hang up and call that person back on a number you trust.";
+
+// Starting points, not values Modulate defines (docs.modulate.ai "Screen a call for voice fraud": set the
+// threshold against your own labelled audio). 8 kHz telephone audio is outside the vendor's published benchmarks.
+export const DEFAULT_AI_VOICE_WINDOW_MS = 6000;
+export const DEFAULT_AI_VOICE_MIN_SHARE_PERCENT = 80;
+export const DEFAULT_AI_VOICE_MIN_CONFIDENCE_PERCENT = 80;
+export const DEFAULT_AI_VOICE_MAX_SECONDS = 180;
 
 // Defaults verified in docs/research/openaiRealtime.md §0 on 2026-09-23; override with the env variables.
 // `gpt-live-transcribe` streams deltas but has no server VAD (the relay commits turns on silence it measures);
@@ -112,6 +147,19 @@ export function loadCallsConfig(env: NodeJS.ProcessEnv = process.env): CallsConf
       }
     : undefined;
 
+  const modulateKey = read(env, "MODULATE_API_KEY");
+  const voice: VoiceDetectionConfig | undefined = modulateKey
+    ? {
+        apiKey: modulateKey,
+        windowMs: readInteger(env, "CALLS_AI_VOICE_WINDOW_MS", DEFAULT_AI_VOICE_WINDOW_MS, 2500, 60_000),
+        minShare: readInteger(env, "CALLS_AI_VOICE_MIN_SHARE_PERCENT", DEFAULT_AI_VOICE_MIN_SHARE_PERCENT, 50, 100) / 100,
+        minConfidence: readInteger(env, "CALLS_AI_VOICE_MIN_CONFIDENCE_PERCENT", DEFAULT_AI_VOICE_MIN_CONFIDENCE_PERCENT, 50, 100) / 100,
+        maxStreamMs: readInteger(env, "CALLS_AI_VOICE_MAX_SECONDS", DEFAULT_AI_VOICE_MAX_SECONDS, 0, 4 * 60 * 60) * 1000,
+        spokenWarning: readBool(env, "CALLS_AI_VOICE_SPOKEN_WARNING", true),
+        warningText: read(env, "CALLS_AI_VOICE_WARNING_TEXT") ?? DEFAULT_AI_VOICE_WARNING,
+      }
+    : undefined;
+
   const tracksRaw = read(env, "CALLS_TRANSCRIBE_TRACKS") ?? "both";
   if (tracksRaw !== "both" && tracksRaw !== "caller") throw new CallsConfigError("CALLS_TRANSCRIBE_TRACKS must be both or caller");
 
@@ -132,6 +180,7 @@ export function loadCallsConfig(env: NodeJS.ProcessEnv = process.env): CallsConf
   return {
     twilio,
     openai,
+    voice,
     transcribeTracks: tracksRaw,
     transcriptionSource: sourceRaw as TranscriptionSource,
     modelMinIntervalMs: readInteger(env, "CALLS_MODEL_MIN_INTERVAL_MS", 3000, 250, 60_000),

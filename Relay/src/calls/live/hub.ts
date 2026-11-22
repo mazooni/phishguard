@@ -44,6 +44,7 @@ export class LiveHub implements SessionObserver {
     session.on("segment", (segment) => this.broadcast(session.deviceId, { type: "transcript.segment", callID, segment }));
     session.on("verdict", (verdict) => this.broadcast(session.deviceId, { type: "verdict.updated", callID, verdict }));
     session.on("alert", (alert) => this.broadcast(session.deviceId, { type: "call.alert", callID, alert }));
+    session.on("voice", (voice) => this.broadcast(session.deviceId, { type: "voice.updated", callID, voice }));
     session.on("ended", () => this.broadcast(session.deviceId, { type: "call.ended", call: session.toSummaryJSON(this.options.now()) }));
   }
 
