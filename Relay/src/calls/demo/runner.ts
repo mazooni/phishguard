@@ -1,7 +1,7 @@
 import type { FastifyBaseLogger } from "fastify";
 
 import type { CallSession, CallSessionManager } from "../session.js";
-import type { CallLine, DemoScenarioId, TranscriptSegment } from "../types.js";
+import type { CallLine, CallVoiceUpdate, DemoScenarioId, TranscriptSegment } from "../types.js";
 import { DEMO_SCENARIOS } from "./scenarios.js";
 
 /**
@@ -9,6 +9,10 @@ import { DEMO_SCENARIOS } from "./scenarios.js";
  * first as a partial (the first half of its words) and ~400 ms later as the final segment; the session completes
  * 1.5 s after the last line. `speed` scales every interval. Everything downstream — rules, model, push, live feed,
  * history — is the real code, because the runner only calls `sessions.create` and `session.addSegment`.
+ *
+ * With `aiVoice` the runner also plays the synthetic-voice detector's part through the same entry point the real
+ * one uses (`session.setVoice`): `analyzing` at the start and `synthetic` a few seconds in, so the AI-voice
+ * warning, its push and the live feed can be seen without Twilio or a Modulate key. Without it nothing differs.
  */
 
 export interface DemoCallRunnerOptions {
@@ -23,6 +27,8 @@ export interface DemoCallStart {
   scenario: DemoScenarioId;
   /** 0.25…4; default 1. */
   speed?: number | undefined;
+  /** Script the caller's voice as AI-generated (see above); default false. */
+  aiVoice?: boolean | undefined;
 }
 
 /** The "protected number" of a demo call for a device without a line. */
@@ -33,6 +39,12 @@ const PARTIAL_TO_FINAL_MS = 400;
 const END_AFTER_LAST_LINE_MS = 1500;
 /** Lines this short are not worth a partial. */
 const MIN_WORDS_FOR_PARTIAL = 3;
+/** The `provider` of a scripted assessment: no vendor heard anything. */
+export const DEMO_VOICE_PROVIDER = "demo:scripted";
+/** When (at speed 1) a demo caller's voice is "judged" synthetic: about what a detector's first full window takes. */
+export const DEMO_VOICE_DETECTED_AFTER_MS = 5000;
+const DEMO_VOICE_ANALYZING: CallVoiceUpdate = { status: "analyzing", syntheticShare: 0, confidence: 0, speechMs: 0, provider: DEMO_VOICE_PROVIDER };
+const DEMO_VOICE_SYNTHETIC: CallVoiceUpdate = { status: "synthetic", syntheticShare: 0.92, confidence: 0.94, speechMs: 6000, provider: DEMO_VOICE_PROVIDER };
 
 export class DemoCallRunner {
   private readonly runs = new Map<string, Set<NodeJS.Timeout>>();
@@ -95,8 +107,17 @@ export class DemoCallRunner {
     });
     schedule(at + END_AFTER_LAST_LINE_MS / speed, () => session.end("completed"));
 
+    if (input.aiVoice === true) {
+      try {
+        session.setVoice(DEMO_VOICE_ANALYZING);
+      } catch (error) {
+        this.options.logger.error({ err: error, callId: session.callId }, "demo: step failed");
+      }
+      schedule(DEMO_VOICE_DETECTED_AFTER_MS / speed, () => session.setVoice(DEMO_VOICE_SYNTHETIC));
+    }
+
     this.options.logger.info(
-      { callId: session.callId, deviceId: input.deviceId, scenario: scenario.id, speed, lines: scenario.lines.length },
+      { callId: session.callId, deviceId: input.deviceId, scenario: scenario.id, speed, lines: scenario.lines.length, ...(input.aiVoice === true ? { aiVoice: true } : {}) },
       "demo: call started",
     );
     return session;

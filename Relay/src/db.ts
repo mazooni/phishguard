@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import type { ApnsEnvironment } from "./config.js";
-import type { AlertLevel, CallLine, CallRecord, CallSource, CallStatus, CallVerdict } from "./calls/types.js";
+import type { AlertLevel, CallLine, CallRecord, CallSource, CallStatus, CallVerdict, CallVoiceAssessment } from "./calls/types.js";
 
 /**
  * SQLite storage. The relay stores only opaque identifiers: device ids, hashed device secrets, APNs tokens,
@@ -126,6 +126,12 @@ const MIGRATIONS: Migration[] = [
       `CREATE INDEX IF NOT EXISTS idx_calls_sid ON calls(twilio_call_sid)`,
     ],
   },
+  {
+    // Call Guard AI-voice detection: the caller's voice assessment (status, share, the warning sent) per call.
+    // An ALTER is not idempotent by itself; `user_version` is what gates it.
+    version: 3,
+    statements: [`ALTER TABLE calls ADD COLUMN voice_json TEXT`],
+  },
 ];
 
 interface RawDevice {
@@ -187,6 +193,7 @@ interface RawCall {
   alert_level: AlertLevel | null;
   twilio_call_sid: string | null;
   updated_at: number;
+  voice_json: string | null;
 }
 
 function toCallLine(row: RawCallLine): CallLine {
@@ -224,6 +231,13 @@ function toCallRecord(row: RawCall): CallRecord {
   }
   if (row.alert_level !== null) record.alertLevel = row.alert_level;
   if (row.twilio_call_sid !== null) record.twilioCallSid = row.twilio_call_sid;
+  if (row.voice_json !== null && row.voice_json !== undefined) {
+    try {
+      record.voice = JSON.parse(row.voice_json) as CallVoiceAssessment;
+    } catch {
+      // A corrupt voice column loses the assessment, not the call.
+    }
+  }
   return record;
 }
 
@@ -311,14 +325,14 @@ export class RelayDb {
            updated_at = excluded.updated_at`,
       ),
       upsertCall: db.prepare<
-        [string, string, string, string, string, number, number | null, string, string | null, number, string | null, string | null, number]
+        [string, string, string, string, string, number, number | null, string, string | null, number, string | null, string | null, number, string | null]
       >(
-        `INSERT INTO calls (call_id, device_id, source, caller_number, called_number, started_at, ended_at, status, verdict_json, alerted, alert_level, twilio_call_sid, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO calls (call_id, device_id, source, caller_number, called_number, started_at, ended_at, status, verdict_json, alerted, alert_level, twilio_call_sid, updated_at, voice_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(call_id) DO UPDATE SET
            ended_at = excluded.ended_at, status = excluded.status, verdict_json = excluded.verdict_json,
            alerted = excluded.alerted, alert_level = excluded.alert_level, twilio_call_sid = excluded.twilio_call_sid,
-           updated_at = excluded.updated_at`,
+           updated_at = excluded.updated_at, voice_json = excluded.voice_json`,
       ),
       findCall: db.prepare<[string], RawCall>("SELECT * FROM calls WHERE call_id = ?"),
       listCalls: db.prepare<[string, number], RawCall>(
@@ -340,7 +354,7 @@ export class RelayDb {
     return new RelayDb(db);
   }
 
-  /** Idempotent: every statement is `CREATE ... IF NOT EXISTS` and `user_version` gates each migration. */
+  /** Idempotent: `user_version` gates each migration (and every `CREATE` is `IF NOT EXISTS`). */
   static migrate(db: Database.Database): void {
     const current = db.pragma("user_version", { simple: true }) as number;
     const apply = db.transaction((migration: Migration) => {
@@ -557,6 +571,7 @@ export class RelayDb {
       record.alertLevel ?? null,
       record.twilioCallSid ?? null,
       record.updatedAt,
+      record.voice ? JSON.stringify(record.voice) : null,
     );
   }
 

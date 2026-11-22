@@ -33,7 +33,7 @@ import { ensureWebSocketPlugin } from "../websocket.js";
  *   DELETE /v1/devices/call-line          204 (idempotent)
  *   GET    /v1/devices/calls?limit=50     this device's calls, newest first (active sessions first)
  *   GET    /v1/devices/calls/:callID      one call (+ transcript while the session is retained in memory)
- *   POST   /v1/devices/calls/demo         {scenario, speed?} → 202 {callID}; 429 too_many_demo_calls
+ *   POST   /v1/devices/calls/demo         {scenario, speed?, aiVoice?} → 202 {callID}; 429 too_many_demo_calls
  *   POST   /v1/devices/calls/test-call    {scenario} → 202 {callID}
  *   GET    /v1/devices/calls/live         WebSocket: hello + every LiveEvent for this device
  */
@@ -58,6 +58,8 @@ interface LineBody {
 interface DemoBody {
   scenario: DemoScenarioId;
   speed?: number;
+  /** Also script the caller's voice as AI-generated (demo/runner.ts). */
+  aiVoice?: boolean;
 }
 
 interface TestCallBody {
@@ -96,6 +98,7 @@ const demoSchema = {
   properties: {
     scenario: { type: "string", enum: [...DEMO_SCENARIO_IDS] },
     speed: { type: "number", minimum: MIN_DEMO_SPEED, maximum: MAX_DEMO_SPEED },
+    aiVoice: { type: "boolean" },
   },
 } as const;
 
@@ -221,7 +224,7 @@ export function registerCallDeviceRoutes(app: FastifyInstance, options: CallDevi
       const running = sessions.activeForDevice(deviceId).filter((session) => session.source === "demo").length;
       if (running >= MAX_ACTIVE_DEMO_CALLS_PER_DEVICE) return reply.code(429).send({ error: "too_many_calls" });
       const line = db.findCallLine(deviceId) ?? null;
-      const session = demo.start({ deviceId, line, scenario: request.body.scenario, speed: request.body.speed });
+      const session = demo.start({ deviceId, line, scenario: request.body.scenario, speed: request.body.speed, aiVoice: request.body.aiVoice });
       return reply.code(202).send({ callID: session.callId });
     });
 

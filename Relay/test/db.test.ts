@@ -17,7 +17,7 @@ describe("RelayDb", () => {
     const path = join(dir, "nested", "relay.sqlite");
 
     const first = RelayDb.open(path);
-    expect(first.db.pragma("user_version", { simple: true })).toBe(2);
+    expect(first.db.pragma("user_version", { simple: true })).toBe(3);
     expect(first.db.pragma("journal_mode", { simple: true })).toBe("wal");
     first.createDevice(
       { deviceId: "d1", secretHash: "h1", apnsToken: "t1", environment: "sandbox", bundleId: "com.x.y" },
@@ -26,7 +26,7 @@ describe("RelayDb", () => {
     first.close();
 
     const second = RelayDb.open(path);
-    expect(second.db.pragma("user_version", { simple: true })).toBe(2);
+    expect(second.db.pragma("user_version", { simple: true })).toBe(3);
     expect(second.findDevice("d1")?.apnsToken).toBe("t1");
     const tables = second.db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")

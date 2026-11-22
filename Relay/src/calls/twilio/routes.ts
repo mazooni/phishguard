@@ -2,9 +2,9 @@ import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from "fastify";
 
 import type { RelayConfig } from "../../config.js";
 import type { RelayDb } from "../../db.js";
-import type { CallsConfig } from "../config.js";
+import { DEFAULT_AI_VOICE_WARNING, type CallsConfig } from "../config.js";
 import type { CallSession, CallSessionInit, CallSessionManager } from "../session.js";
-import { redactNumber, type CallStatus, type Transcriber } from "../types.js";
+import { redactNumber, type CallStatus, type Transcriber, type VoiceDetector } from "../types.js";
 import { twilioErrorFields, type TwilioClient } from "./client.js";
 import { MediaConnection } from "./media.js";
 import { ringbackWav } from "./ringback.js";
@@ -48,6 +48,8 @@ export interface TwilioRoutesOptions {
   sessions: CallSessionManager;
   twilio: TwilioClient | undefined;
   transcriber: Transcriber | undefined;
+  /** AI-voice detection on the caller's audio; absent (no `MODULATE_API_KEY`) leaves every route as it is without it. */
+  voiceDetector?: VoiceDetector | undefined;
   logger: FastifyBaseLogger;
   now: () => number;
   /** Supplies a test call's scripted lines by scenario id; the built-in "grandparent" script when absent or unknown. */
@@ -100,7 +102,7 @@ export function endedStatusFor(twilioStatus: string | undefined): CallStatus | u
 
 export function registerTwilioRoutes(app: FastifyInstance, options: TwilioRoutesOptions): void {
   ensureWebPlugins(app);
-  const { config, calls, db, sessions, transcriber, now } = options;
+  const { config, calls, db, sessions, transcriber, voiceDetector, now } = options;
   const log = options.logger.child({ module: "calls.twilio" });
   // The Media Streams socket is also the replay script's input (docs/CALLS.md §4 `replay`), so it exists whenever
   // Call Guard is on; without a Twilio client the handshake signature is simply never checked.
@@ -108,6 +110,7 @@ export function registerTwilioRoutes(app: FastifyInstance, options: TwilioRoutes
     sessions,
     twilio: options.twilio,
     transcriber,
+    voiceDetector,
     transcribeTracks: calls.transcribeTracks,
     publicBaseUrl: config.publicBaseUrl,
     log,
@@ -139,10 +142,29 @@ export function registerTwilioRoutes(app: FastifyInstance, options: TwilioRoutes
     return type === "Full" ? "openai" : "twilio";
   }
 
-  if (calls.transcriptionSource === "auto") {
+  /**
+   * Whether a call needs the extra caller-only `<Stream>` for the voice detector: only a call Twilio transcribes
+   * (source `openai` already streams the caller's track), and only on a Full account — a Trial account blocks
+   * Media Streams, and an account whose type could not be fetched is treated like one.
+   */
+  async function wantsVoiceStream(source: ResolvedTranscriptionSource): Promise<boolean> {
+    if (!voiceDetector || source !== "twilio") return false;
+    // `auto` with OpenAI available chooses Twilio's transcription only when the account is not known to be Full.
+    if (calls.transcriptionSource === "auto" && calls.openai && transcriber) return false;
+    const type = await withinDeadline(twilio.fetchAccountType(), ACCOUNT_TYPE_DEADLINE_MS, "unknown");
+    return type === "Full";
+  }
+
+  // The account type is fetched once at start-up so that no voice webhook has to wait for it.
+  if (calls.transcriptionSource === "auto" || voiceDetector) {
     void twilio.fetchAccountType().then((type) => {
-      log.info({ accountType: type }, "calls: twilio account type resolved");
-      if (type === "Trial") log.warn("calls: Trial account — <Stream> is blocked, using Twilio transcription; calls only to verified numbers");
+      if (calls.transcriptionSource === "auto") {
+        log.info({ accountType: type }, "calls: twilio account type resolved");
+        if (type === "Trial") log.warn("calls: Trial account — <Stream> is blocked, using Twilio transcription; calls only to verified numbers");
+      }
+      if (voiceDetector && type === "Trial") {
+        log.warn("calls: AI-voice detection is configured, but a Trial account blocks the <Stream> it needs; callers' voices are not checked");
+      }
     });
   }
 
@@ -241,6 +263,7 @@ export function registerTwilioRoutes(app: FastifyInstance, options: TwilioRoutes
         return sendTwiml(reply, loopGuardTwiml());
       }
       const source = await resolveTranscriptionSource();
+      const voiceStream = await wantsVoiceStream(source);
       const init: CallSessionInit = {
         deviceId: line.deviceId,
         line,
@@ -270,7 +293,7 @@ export function registerTwilioRoutes(app: FastifyInstance, options: TwilioRoutes
           }
         },
       );
-      return sendTwiml(reply, inboundCallTwiml({ session, source, publicBaseUrl, transcribeTracks: calls.transcribeTracks }));
+      return sendTwiml(reply, inboundCallTwiml({ session, source, publicBaseUrl, transcribeTracks: calls.transcribeTracks, voiceStream }));
     });
 
     // Call status callbacks for the caller leg (from the number's status callback or our own URL), the user leg and test calls.
@@ -355,9 +378,15 @@ export function registerTwilioRoutes(app: FastifyInstance, options: TwilioRoutes
       async (_request, reply) => reply.type("audio/wav").send(ringbackWav()),
     );
 
-    // Participant AnnounceUrl: the spoken warning for the user leg.
+    // Participant AnnounceUrl: the spoken warning for the user leg. `slot=voice` asks for the AI-voice warning;
+    // without it (every URL the scam warning has ever used) this is the scam warning.
     scoped.post("/v1/calls/twilio/announce", perCall, async (request, reply) => {
       const session = request.twilioSession!;
+      if (queryParams(request.query)["slot"] === "voice") {
+        const voiceText = twilio.announcementText(session, "voice") ?? calls.voice?.warningText ?? DEFAULT_AI_VOICE_WARNING;
+        log.info({ callId: session.callId }, "calls: announcing the AI-voice warning");
+        return sendTwiml(reply, announceTwiml(voiceText));
+      }
       const text = twilio.announcementText(session) ?? calls.spokenWarningText;
       log.info({ callId: session.callId }, "calls: announcing the warning");
       return sendTwiml(reply, announceTwiml(text));
@@ -370,8 +399,9 @@ export function registerTwilioRoutes(app: FastifyInstance, options: TwilioRoutes
       const script = options.testCallScript?.(scenario) ?? DEFAULT_TEST_CALL_SCRIPT;
       const source = session.transcriptionSource ?? (await resolveTranscriptionSource());
       session.transcriptionSource ??= source;
+      const voiceStream = await wantsVoiceStream(source);
       log.info({ callId: session.callId, scenario, transcription: source }, "calls: test call answered");
-      return sendTwiml(reply, testCallTwiml({ session, source, publicBaseUrl, transcribeTracks: calls.transcribeTracks, script }));
+      return sendTwiml(reply, testCallTwiml({ session, source, publicBaseUrl, transcribeTracks: calls.transcribeTracks, script, voiceStream }));
     });
 
   });
@@ -381,18 +411,20 @@ interface MediaRouteOptions {
   sessions: CallSessionManager;
   twilio: TwilioClient | undefined;
   transcriber: Transcriber | undefined;
+  voiceDetector: VoiceDetector | undefined;
   transcribeTracks: "both" | "caller";
   publicBaseUrl: string;
   log: FastifyBaseLogger;
 }
 
 /**
- * Media Streams WebSocket (source `openai`; docs/CALLS.md §5.2). The path token must belong to a live session
- * before the upgrade happens. Registered with or without Twilio: `npm run calls:replay` feeds it Twilio-shaped
- * frames for a `replay` session, which needs only OpenAI.
+ * Media Streams WebSocket (source `openai`, or the caller-only voice stream of a call Twilio transcribes;
+ * docs/CALLS.md §5.2). The path token must belong to a live session before the upgrade happens. Registered with
+ * or without Twilio: `npm run calls:replay` feeds it Twilio-shaped frames for a `replay` session, which needs
+ * only OpenAI (or only a voice detector).
  */
 function registerMediaRoute(app: FastifyInstance, options: MediaRouteOptions): void {
-  const { sessions, twilio, transcriber, transcribeTracks, publicBaseUrl, log } = options;
+  const { sessions, twilio, transcriber, voiceDetector, transcribeTracks, publicBaseUrl, log } = options;
   // One live media connection per call: a second connection for the same token supersedes the first (its
   // transcriber handles are released), so a Twilio reconnect never doubles the OpenAI sessions.
   const mediaConnections = new Map<string, MediaConnection>();
@@ -449,6 +481,9 @@ function registerMediaRoute(app: FastifyInstance, options: MediaRouteOptions): v
           transcriber,
           transcribeTracks,
           logger: log,
+          voiceDetector,
+          // Only a stream Twilio itself opened can be stopped there (a replay has no Twilio behind it).
+          stopStream: twilio && (session.source === "twilio" || session.source === "test-call") ? (callSid, streamSid) => twilio.stopStream(callSid, streamSid) : undefined,
         });
         mediaConnections.set(session.callId, connection);
         socket.on("close", () => {

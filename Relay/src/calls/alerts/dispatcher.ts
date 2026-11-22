@@ -33,6 +33,18 @@ export const CALL_ALERT_EXPIRATION_SECONDS = 120;
 /** APNs allows 4096 bytes; the guard keeps a margin for the headers apns2 adds nothing to and for `aps` extras. */
 export const MAX_ALERT_PAYLOAD_BYTES = 3500;
 
+/**
+ * What the AI-voice dispatcher lends the spoken scam warning (alerts/voiceDispatcher.ts). A test call can play one
+ * announcement only — speaking replaces its TwiML — so when its "caller" was already judged synthetic the scam
+ * warning carries one extra sentence instead of a second announcement. Never anything for any other call.
+ */
+export interface SpokenAddendum {
+  /** The sentence to append for this session, or undefined (always, unless its voice is `synthetic`). */
+  addendumFor(session: CallSession): string | undefined;
+  /** Twilio accepted a warning that carried the sentence. */
+  addendumSpoken(session: CallSession): void;
+}
+
 export interface CallAlertDispatcherOptions {
   db: RelayDb;
   pushSender: PushSender;
@@ -41,6 +53,8 @@ export interface CallAlertDispatcherOptions {
   config: CallsConfig;
   logger: FastifyBaseLogger;
   now: () => number;
+  /** Absent in tests that have no AI-voice dispatcher: the spoken warning is then always the configured text. */
+  voiceAddendum?: SpokenAddendum | undefined;
 }
 
 export class CallAlertDispatcher implements SessionObserver {
@@ -48,6 +62,15 @@ export class CallAlertDispatcher implements SessionObserver {
   private readonly pending = new Map<string, AlertLevel>();
 
   constructor(private readonly options: CallAlertDispatcherOptions) {}
+
+  /**
+   * True from the moment an alert for this call is decided until it is recorded on the session — the stretch in
+   * which its spoken warning may already be playing although `session.alerts` does not show it yet. Read-only:
+   * the AI-voice dispatcher asks so that its own announcement does not start on top of this one.
+   */
+  isAlerting(callId: string): boolean {
+    return this.pending.has(callId);
+  }
 
   attach(session: CallSession): void {
     session.on("verdict", (verdict) => {
@@ -103,37 +126,9 @@ export class CallAlertDispatcher implements SessionObserver {
     logger.info({ ...context, pushed, spoken }, "call-alert: recorded");
   }
 
-  private async push(session: CallSession, verdict: CallVerdict, level: AlertLevel, text: AlertText): Promise<boolean> {
-    const { db, logger, pushSender, apnsConfigured } = this.options;
-    const device = db.findDevice(session.deviceId);
+  private push(session: CallSession, verdict: CallVerdict, level: AlertLevel, text: AlertText): Promise<boolean> {
     const context = { callId: session.callId, deviceId: session.deviceId, level };
-    if (!device?.apnsToken) {
-      logger.info(context, "call-alert: device has no APNs token; push skipped");
-      return false;
-    }
-    if (!apnsConfigured) {
-      logger.info(context, "call-alert: apns not configured; push skipped");
-      return false;
-    }
-    const apnsToken = device.apnsToken;
-    const request = buildAlertPushRequest(session, verdict, level, text, { deviceId: device.deviceId, environment: device.environment, apnsToken });
-    const outcome = await pushSender.sendAlert(request);
-    if (outcome.ok) {
-      logger.info({ ...context, retried: outcome.retried }, "call-alert: pushed");
-      return true;
-    }
-    if (outcome.dropToken) {
-      // Apple: on 410, drop the token only if it was not re-registered after APNs' `timestamp` (as push.ts does).
-      if (outcome.invalidSince !== undefined && device.updatedAt > outcome.invalidSince) {
-        logger.info({ ...context, reason: outcome.reason }, "call-alert: token re-registered after APNs 410; keeping");
-        return false;
-      }
-      const cleared = db.clearApnsToken(device.deviceId, apnsToken);
-      logger.warn({ ...context, reason: outcome.reason, status: outcome.status, cleared }, "call-alert: token dropped");
-      return false;
-    }
-    logger.warn({ ...context, reason: outcome.reason, status: outcome.status, retried: outcome.retried }, "call-alert: push failed");
-    return false;
+    return deliverAlertPush(this.options, session.deviceId, "call-alert", context, (device) => buildAlertPushRequest(session, verdict, level, text, device));
   }
 
   private async speak(session: CallSession): Promise<boolean> {
@@ -141,10 +136,67 @@ export class CallAlertDispatcher implements SessionObserver {
     if (!voice) return false;
     if (session.line?.spokenWarning === false) return false;
     if (session.status !== "in_progress") return false;
-    const accepted = await voice.speakToUser(session, this.options.config.spokenWarningText);
+    // Only ever set on a test call whose voice is already `synthetic` (see `SpokenAddendum`).
+    const addendum = this.options.voiceAddendum?.addendumFor(session);
+    const warning = this.options.config.spokenWarningText;
+    const accepted = await voice.speakToUser(session, addendum ? `${warning} ${addendum}` : warning);
     this.options.logger.info({ callId: session.callId, accepted }, "call-alert: spoken warning requested");
+    if (accepted && addendum) this.options.voiceAddendum?.addendumSpoken(session);
     return accepted;
   }
+}
+
+/** What a push needs besides the request: where the token lives, who sends, and whether APNs is configured at all. */
+export interface AlertPushDelivery {
+  db: RelayDb;
+  pushSender: PushSender;
+  apnsConfigured: boolean;
+  logger: FastifyBaseLogger;
+}
+
+export type AlertPushDevice = Pick<DeviceRow, "deviceId" | "environment"> & { apnsToken: string };
+
+/**
+ * Sends one alert push under the device-token rules every Call Guard alert shares: no token or no APNs ⇒ skipped;
+ * a 410 drops the token unless it was re-registered since. Resolves whether APNs accepted the push. `label`
+ * prefixes the log lines ("call-alert" for the scam alert) and `context` is logged with each of them.
+ */
+export async function deliverAlertPush(
+  delivery: AlertPushDelivery,
+  deviceId: string,
+  label: string,
+  context: Record<string, unknown>,
+  build: (device: AlertPushDevice) => AlertPushRequest,
+): Promise<boolean> {
+  const { db, logger, pushSender, apnsConfigured } = delivery;
+  const device = db.findDevice(deviceId);
+  if (!device?.apnsToken) {
+    logger.info(context, `${label}: device has no APNs token; push skipped`);
+    return false;
+  }
+  if (!apnsConfigured) {
+    logger.info(context, `${label}: apns not configured; push skipped`);
+    return false;
+  }
+  const apnsToken = device.apnsToken;
+  const request = build({ deviceId: device.deviceId, environment: device.environment, apnsToken });
+  const outcome = await pushSender.sendAlert(request);
+  if (outcome.ok) {
+    logger.info({ ...context, retried: outcome.retried }, `${label}: pushed`);
+    return true;
+  }
+  if (outcome.dropToken) {
+    // Apple: on 410, drop the token only if it was not re-registered after APNs' `timestamp` (as push.ts does).
+    if (outcome.invalidSince !== undefined && device.updatedAt > outcome.invalidSince) {
+      logger.info({ ...context, reason: outcome.reason }, `${label}: token re-registered after APNs 410; keeping`);
+      return false;
+    }
+    const cleared = db.clearApnsToken(device.deviceId, apnsToken);
+    logger.warn({ ...context, reason: outcome.reason, status: outcome.status, cleared }, `${label}: token dropped`);
+    return false;
+  }
+  logger.warn({ ...context, reason: outcome.reason, status: outcome.status, retried: outcome.retried }, `${label}: push failed`);
+  return false;
 }
 
 /** Only calls that actually run through Twilio have a leg to speak into; demo and replay sessions get no voice. */
@@ -165,7 +217,7 @@ export function buildAlertPushRequest(
   verdict: CallVerdict,
   level: AlertLevel,
   text: AlertText,
-  device: Pick<DeviceRow, "deviceId" | "environment"> & { apnsToken: string },
+  device: AlertPushDevice,
 ): AlertPushRequest {
   const data: Record<string, string | number | boolean> = {
     kind: "call-alert",
@@ -177,6 +229,19 @@ export function buildAlertPushRequest(
     startedAt: session.startedAt,
     sequence: verdict.sequence,
   };
+  return composeAlertPushRequest(text, device, `call-${session.callId}`, data);
+}
+
+/**
+ * The parts every Call Guard alert push shares (thread, category, urgency, expiry) around its own words, collapse
+ * id and custom keys, with the body trimmed until the payload fits.
+ */
+export function composeAlertPushRequest(
+  text: AlertText,
+  device: AlertPushDevice,
+  collapseId: string,
+  data: Record<string, string | number | boolean>,
+): AlertPushRequest {
   const request: AlertPushRequest = {
     deviceId: device.deviceId,
     apnsToken: device.apnsToken,
@@ -188,7 +253,7 @@ export function buildAlertPushRequest(
     category: CALL_ALERT_CATEGORY,
     interruptionLevel: "time-sensitive",
     relevanceScore: 1,
-    collapseId: `call-${session.callId}`,
+    collapseId,
     expirationSeconds: CALL_ALERT_EXPIRATION_SECONDS,
     contentAvailable: true,
     data,

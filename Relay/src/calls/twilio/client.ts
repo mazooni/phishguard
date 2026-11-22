@@ -9,7 +9,7 @@ import type {
 
 import type { TwilioConfig } from "../config.js";
 import type { CallSession } from "../session.js";
-import { redactNumber, type VoiceControl } from "../types.js";
+import { redactNumber, type AnnouncementSlot, type VoiceControl } from "../types.js";
 import { announceTwiml, callbackUrl, conferenceNameFor } from "./twiml.js";
 
 /**
@@ -34,8 +34,16 @@ export interface TwilioClient extends VoiceControl {
   redirectCall(callSid: string, twiml: string): Promise<boolean>;
   /** Ends one call leg (`status: completed`). */
   endCall(callSid: string): Promise<boolean>;
-  /** The text the last `speakToUser` asked to be spoken on this session — what the announce webhook plays. */
-  announcementText(session: CallSession): string | undefined;
+  /**
+   * Stops one unidirectional Media Stream of a live call (Stream resource, `status: stopped`), by the stream's
+   * SID as its `start` message gave it. The call itself and any other fork are untouched.
+   */
+  stopStream(callSid: string, streamSid: string): Promise<boolean>;
+  /**
+   * The text the last `speakToUser` asked to be spoken on this session in this slot (default `scam`) — what the
+   * announce webhook plays.
+   */
+  announcementText(session: CallSession, slot?: AnnouncementSlot): string | undefined;
 }
 
 /** The REST operations the client needs, as a port: the SDK behind it in production, a recording fake in tests. */
@@ -47,6 +55,8 @@ export interface TwilioRest {
   findConferenceSid(friendlyName: string): Promise<string | undefined>;
   createCall(params: CallListInstanceCreateOptions): Promise<{ sid: string }>;
   updateCall(callSid: string, params: CallContextUpdateOptions): Promise<unknown>;
+  /** Calls/{CallSid}/Streams/{Sid} with `Status=stopped`. */
+  stopStream(callSid: string, streamSid: string): Promise<unknown>;
   /** The account's `type` property (`Trial` | `Full`). */
   fetchAccountType(): Promise<string>;
 }
@@ -102,6 +112,7 @@ export function sdkRest(config: TwilioConfig): TwilioRest {
     },
     createCall: (params) => client.calls.create(params),
     updateCall: (callSid, params) => client.calls(callSid).update(params),
+    stopStream: (callSid, streamSid) => client.calls(callSid).streams(streamSid).update({ status: "stopped" }),
     fetchAccountType: async () => (await client.api.v2010.accounts(config.accountSid).fetch()).type,
   };
 }
@@ -109,14 +120,17 @@ export function sdkRest(config: TwilioConfig): TwilioRest {
 export function createTwilioClient(options: TwilioClientOptions): TwilioClient {
   const { config, publicBaseUrl, logger } = options;
   const rest = options.rest ?? sdkRest(config);
-  const announcements = new Map<string, { text: string; at: number }>();
+  // One text per call and slot: a scam warning and an AI-voice warning requested close together each keep their own.
+  const announcements: Record<AnnouncementSlot, Map<string, { text: string; at: number }>> = { scam: new Map(), voice: new Map() };
   let accountType: TwilioAccountType = "unknown";
   let accountFetch: Promise<TwilioAccountType> | undefined;
 
-  function rememberAnnouncement(callId: string, text: string): void {
+  function rememberAnnouncement(callId: string, text: string, slot: AnnouncementSlot): void {
     const now = Date.now();
-    for (const [key, value] of announcements) if (now - value.at > ANNOUNCEMENT_TTL_MS) announcements.delete(key);
-    announcements.set(callId, { text, at: now });
+    for (const texts of Object.values(announcements)) {
+      for (const [key, value] of texts) if (now - value.at > ANNOUNCEMENT_TTL_MS) texts.delete(key);
+    }
+    announcements[slot].set(callId, { text, at: now });
   }
 
   const client: TwilioClient = {
@@ -157,9 +171,12 @@ export function createTwilioClient(options: TwilioClientOptions): TwilioClient {
       return call.sid;
     },
 
-    async speakToUser(session, text) {
+    async speakToUser(session, text, slot = "scam") {
       try {
         if (session.source === "test-call") {
+          // Only the scam warning may end the scripted "scammer"; an AI-voice warning rides along with it instead
+          // (alerts/voiceDispatcher.ts) — a test call's caller is Twilio's own synthetic voice.
+          if (slot === "voice") return false;
           if (!session.twilioCallSid) return false;
           // Replacing the call's TwiML ends the scripted "scammer" and plays the warning (docs/CALLS.md §5.2).
           await rest.updateCall(session.twilioCallSid, { twiml: announceTwiml(text) });
@@ -174,12 +191,13 @@ export function createTwilioClient(options: TwilioClientOptions): TwilioClient {
         }
         const conference = session.conferenceSid ?? session.conferenceName;
         if (!conference) return false;
-        rememberAnnouncement(session.callId, text);
+        rememberAnnouncement(session.callId, text, slot);
         await rest.updateParticipant(conference, session.userCallSid ?? USER_PARTICIPANT_LABEL, {
-          announceUrl: callbackUrl(publicBaseUrl, "announce", session),
+          // The scam slot's URL is the one Twilio has always been given; the voice slot names itself.
+          announceUrl: slot === "voice" ? callbackUrl(publicBaseUrl, "announce", session, { slot }) : callbackUrl(publicBaseUrl, "announce", session),
           announceMethod: "POST",
         });
-        logger.info({ callId: session.callId }, "twilio: warning announced to the user leg");
+        logger.info({ callId: session.callId }, slot === "voice" ? "twilio: AI-voice warning announced to the user leg" : "twilio: warning announced to the user leg");
         return true;
       } catch (error) {
         logger.error({ reason: twilioErrorFields(error), callId: session.callId }, "twilio: could not speak to the user");
@@ -248,8 +266,19 @@ export function createTwilioClient(options: TwilioClientOptions): TwilioClient {
       }
     },
 
-    announcementText(session) {
-      return announcements.get(session.callId)?.text;
+    async stopStream(callSid, streamSid) {
+      try {
+        await rest.stopStream(callSid, streamSid);
+        return true;
+      } catch (error) {
+        // Not an error for the call: the stream simply keeps running until the call ends (or already stopped).
+        logger.warn({ reason: twilioErrorFields(error) }, "twilio: could not stop the media stream");
+        return false;
+      }
+    },
+
+    announcementText(session, slot = "scam") {
+      return announcements[slot].get(session.callId)?.text;
     },
   };
   return client;

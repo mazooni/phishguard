@@ -49,6 +49,11 @@ class FakeRest implements TwilioRest {
     this.record("createCall", params);
     return { sid: "CA" + "t".repeat(32) };
   }
+  async stopStream(callSid: string, streamSid: string) {
+    this.record("stopStream", callSid, streamSid);
+    return {};
+  }
+
   async updateCall(sid: string, params: unknown) {
     this.record("updateCall", sid, params);
     return {};
@@ -227,6 +232,14 @@ describe("createTwilioClient", () => {
     bare.twilioCallSid = undefined;
     await expect(client.hangUp(bare)).resolves.toBe(false);
     expect(rest.calls).toHaveLength(2);
+  });
+
+  it("stopStream stops one media stream by its SID and reports failure as false without throwing", async () => {
+    const { client, rest } = make();
+    await expect(client.stopStream("CA1", "MZ1")).resolves.toBe(true);
+    expect(rest.calls).toEqual([{ op: "stopStream", args: ["CA1", "MZ1"] }]);
+    rest.fail = { stopStream: new Error("20404") };
+    await expect(client.stopStream("CA1", "MZ1")).resolves.toBe(false);
   });
 
   it("redirectCall and endCall update the call, and report failure as false", async () => {

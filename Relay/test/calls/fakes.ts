@@ -1,16 +1,37 @@
 import type { FastifyBaseLogger } from "fastify";
 
-import type { CallsConfig, OpenAIConfig, TwilioConfig } from "../../src/calls/config.js";
-import { DEFAULT_SCORING_MODEL, DEFAULT_SPOKEN_WARNING, DEFAULT_TRANSCRIBE_MODEL } from "../../src/calls/config.js";
+import type { CallsConfig, OpenAIConfig, TwilioConfig, VoiceDetectionConfig } from "../../src/calls/config.js";
+import {
+  DEFAULT_AI_VOICE_MAX_SECONDS,
+  DEFAULT_AI_VOICE_MIN_CONFIDENCE_PERCENT,
+  DEFAULT_AI_VOICE_MIN_SHARE_PERCENT,
+  DEFAULT_AI_VOICE_WARNING,
+  DEFAULT_AI_VOICE_WINDOW_MS,
+  DEFAULT_SCORING_MODEL,
+  DEFAULT_SPOKEN_WARNING,
+  DEFAULT_TRANSCRIBE_MODEL,
+} from "../../src/calls/config.js";
+import { MODULATE_VOICE_PROVIDER } from "../../src/calls/modulate/voiceDetector.js";
 import type { ModelScorer, ModelScoringInput, ModelScoringResult } from "../../src/calls/openai/scorer.js";
 import type { CallSession } from "../../src/calls/session.js";
 import type { TwilioAccountType, TwilioClient } from "../../src/calls/twilio/client.js";
-import type { Speaker, Transcriber, TranscriberHandle, TranscriptSegment } from "../../src/calls/types.js";
+import type {
+  AnnouncementSlot,
+  CallVoiceAssessment,
+  CallVoiceUpdate,
+  Speaker,
+  Transcriber,
+  TranscriberHandle,
+  TranscriptSegment,
+  VoiceDetector,
+  VoiceDetectorHandle,
+  VoiceStatus,
+} from "../../src/calls/types.js";
 
 /**
  * Shared fakes for Call Guard tests (docs/CALLS.md). Every external service the module talks to — Twilio REST,
- * OpenAI Realtime transcription, the OpenAI scorer — has a recording fake here so route, detector and alert
- * tests never touch the network. Test files under test/calls/ import these; add new fakes here rather than
+ * OpenAI Realtime transcription, the OpenAI scorer, Modulate voice detection — has a recording fake here so
+ * route, detector and alert tests never touch the network. Test files under test/calls/ import these; add new fakes here rather than
  * editing test/helpers.ts.
  */
 
@@ -28,11 +49,29 @@ export function testOpenAIConfig(overrides: Partial<OpenAIConfig> = {}): OpenAIC
   return { apiKey: "sk-test", transcribeModel: DEFAULT_TRANSCRIBE_MODEL, scoringModel: DEFAULT_SCORING_MODEL, ...overrides };
 }
 
+/** Not a real key: distinctive enough that a test can assert it never reaches a log line. */
+export const MODULATE_TEST_KEY = "mdl-test-key-7f3a9c1e5b2d";
+
+/** The AI-voice section as `MODULATE_API_KEY` alone would configure it (the defaults of src/calls/config.ts). */
+export function testVoiceConfig(overrides: Partial<VoiceDetectionConfig> = {}): VoiceDetectionConfig {
+  return {
+    apiKey: MODULATE_TEST_KEY,
+    windowMs: DEFAULT_AI_VOICE_WINDOW_MS,
+    minShare: DEFAULT_AI_VOICE_MIN_SHARE_PERCENT / 100,
+    minConfidence: DEFAULT_AI_VOICE_MIN_CONFIDENCE_PERCENT / 100,
+    maxStreamMs: DEFAULT_AI_VOICE_MAX_SECONDS * 1000,
+    spokenWarning: true,
+    warningText: DEFAULT_AI_VOICE_WARNING,
+    ...overrides,
+  };
+}
+
 /** A Call Guard config with Twilio and OpenAI "configured" (the fakes stand in for both). */
 export function testCallsConfig(overrides: Partial<CallsConfig> = {}): CallsConfig {
   return {
     twilio: testTwilioConfig(),
     openai: testOpenAIConfig(),
+    voice: undefined,
     transcribeTracks: "both",
     transcriptionSource: "openai",
     modelMinIntervalMs: 250,
@@ -52,6 +91,8 @@ export class FakeTwilioClient implements TwilioClient {
   readonly dialed: { callId: string; sid: string }[] = [];
   readonly testCalls: { callId: string; scenario: string; sid: string }[] = [];
   readonly spoken: { callId: string; text: string }[] = [];
+  /** `speakToUser(…, "voice")` requests: the AI-voice announcements, kept apart from the scam warnings in `spoken`. */
+  readonly voiceSpoken: { callId: string; text: string }[] = [];
   readonly hungUp: string[] = [];
   readonly signatureChecks: { signature: string | undefined; url: string; params: Record<string, string> }[] = [];
   /** `redirectCall` requests: the caller-leg TwiML replacements (e.g. "could not reach"). */
@@ -79,7 +120,13 @@ export class FakeTwilioClient implements TwilioClient {
     return sid;
   }
 
-  async speakToUser(session: CallSession, text: string): Promise<boolean> {
+  async speakToUser(session: CallSession, text: string, slot: AnnouncementSlot = "scam"): Promise<boolean> {
+    if (slot === "voice") {
+      // Like the real client: a test call's TwiML is never replaced for the AI-voice warning.
+      if (session.source === "test-call") return false;
+      this.voiceSpoken.push({ callId: session.callId, text });
+      return true;
+    }
     this.spoken.push({ callId: session.callId, text });
     return true;
   }
@@ -104,13 +151,22 @@ export class FakeTwilioClient implements TwilioClient {
     return true;
   }
 
+  /** `stopStream` requests: `[callSid, streamSid]`. */
+  readonly stoppedStreams: [string, string][] = [];
+
+  async stopStream(callSid: string, streamSid: string): Promise<boolean> {
+    this.stoppedStreams.push([callSid, streamSid]);
+    return true;
+  }
+
   async endCall(callSid: string): Promise<boolean> {
     this.endedCalls.push(callSid);
     return true;
   }
 
-  announcementText(session: CallSession): string | undefined {
-    return this.spoken.filter((entry) => entry.callId === session.callId).at(-1)?.text;
+  announcementText(session: CallSession, slot: AnnouncementSlot = "scam"): string | undefined {
+    const requests = slot === "voice" ? this.voiceSpoken : this.spoken;
+    return requests.filter((entry) => entry.callId === session.callId).at(-1)?.text;
   }
 }
 
@@ -152,6 +208,71 @@ export class FakeTranscriberHandle implements TranscriberHandle {
     const segment: TranscriptSegment = { id: `${this.speaker}-${++this.counter}`, speaker: this.speaker, text, atMs, final };
     this.session.addSegment(segment);
     return segment;
+  }
+}
+
+/**
+ * A voice detector whose handles record the caller audio they are given and let the test report an assessment.
+ * Like the real one, a handle reports `analyzing` the moment it is opened. Opt-in: `createCallsTestApp` only
+ * injects one when asked (or when the test's config has a `voice` section), so no other test sees voice events.
+ */
+export class FakeVoiceDetector implements VoiceDetector {
+  readonly handles: FakeVoiceDetectorHandle[] = [];
+  closed = false;
+
+  open(session: CallSession): VoiceDetectorHandle {
+    const handle = new FakeVoiceDetectorHandle(session);
+    this.handles.push(handle);
+    handle.report("analyzing", { syntheticShare: 0, confidence: 0, speechMs: 0 });
+    return handle;
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+    for (const handle of this.handles) handle.closed = true;
+  }
+
+  /** The most recent handle for a call (a second media stream opens a second one). */
+  handle(callId?: string): FakeVoiceDetectorHandle | undefined {
+    return this.handles.filter((h) => callId === undefined || h.session.callId === callId).at(-1);
+  }
+
+  /** Every base64 payload pushed for a call, across its handles, in order. */
+  audioFor(callId: string): string[] {
+    return this.handles.filter((h) => h.session.callId === callId).flatMap((h) => h.audio);
+  }
+}
+
+export class FakeVoiceDetectorHandle implements VoiceDetectorHandle {
+  readonly audio: string[] = [];
+  closed = false;
+  /** Ends the handle the way the real one does after a latch, the cap or a refusal. */
+  finish!: () => void;
+  readonly finished = new Promise<void>((resolve) => {
+    this.finish = resolve;
+  });
+
+  constructor(readonly session: CallSession) {}
+
+  pushAudio(base64Mulaw: string): void {
+    this.audio.push(base64Mulaw);
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+
+  /** What the real detector does when the vendor's frames add up to (or change) an assessment. */
+  report(status: VoiceStatus, overrides: Partial<CallVoiceUpdate> = {}): CallVoiceAssessment | undefined {
+    const decided = status === "human" || status === "synthetic";
+    return this.session.setVoice({
+      status,
+      syntheticShare: status === "synthetic" ? 1 : 0,
+      confidence: decided ? 0.95 : 0,
+      speechMs: decided ? DEFAULT_AI_VOICE_WINDOW_MS : 0,
+      provider: MODULATE_VOICE_PROVIDER,
+      ...overrides,
+    });
   }
 }
 

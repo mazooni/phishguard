@@ -3,7 +3,7 @@ import type { FastifyInstance } from "fastify";
 import type { PushFailure, PushOutcome, PushRequest, PushSender } from "../src/apns.js";
 import type { CallsConfig } from "../src/calls/config.js";
 import type { AlertPushRequest } from "../src/calls/types.js";
-import { FakeScorer, FakeTranscriber, FakeTwilioClient, testCallsConfig } from "./calls/fakes.js";
+import { FakeScorer, FakeTranscriber, FakeTwilioClient, FakeVoiceDetector, testCallsConfig } from "./calls/fakes.js";
 import type { RelayConfig } from "../src/config.js";
 import { RelayDb, type Provider } from "../src/db.js";
 import type { IdTokenClaims, TokenVerifier } from "../src/routes/gmail.js";
@@ -136,8 +136,15 @@ export interface CallsTestContext extends TestContext {
   twilio: FakeTwilioClient;
   transcriber: FakeTranscriber;
   scorer: FakeScorer;
+  /** Present only when the test opted in (`extras.voiceDetector`, or a `voice` section in its Call Guard config). */
+  voiceDetector?: FakeVoiceDetector | undefined;
   /** Every test starts at this fake clock; advance it with `ctx.clock.advance(ms)`. */
   clock: FakeClock;
+}
+
+export interface CallsTestExtras {
+  /** `true` (or an instance) injects a `FakeVoiceDetector`; by default a relay under test has none. */
+  voiceDetector?: FakeVoiceDetector | boolean | undefined;
 }
 
 export class FakeClock {
@@ -157,10 +164,13 @@ export class FakeClock {
 /**
  * A relay with Call Guard enabled and every external service replaced by the fakes in test/calls/fakes.ts.
  * `callsOverrides` tweaks the Call Guard config (e.g. `{ openai: undefined }` for a rules-only relay).
+ * The voice detector is opt-in through `extras` — and always the fake when the config has a `voice` section, so a
+ * test can never open a real vendor socket.
  */
 export async function createCallsTestApp(
   callsOverrides: Partial<CallsConfig> = {},
   overrides: Partial<RelayConfig> = {},
+  extras: CallsTestExtras = {},
 ): Promise<CallsTestContext> {
   const config = testConfig({ calls: testCallsConfig(callsOverrides), ...overrides });
   const db = RelayDb.open(":memory:");
@@ -170,16 +180,22 @@ export async function createCallsTestApp(
   const transcriber = new FakeTranscriber();
   const scorer = new FakeScorer();
   const clock = new FakeClock();
+  const voiceDetector =
+    extras.voiceDetector instanceof FakeVoiceDetector
+      ? extras.voiceDetector
+      : extras.voiceDetector === true || config.calls?.voice !== undefined
+        ? new FakeVoiceDetector()
+        : undefined;
   const app = buildApp({
     config,
     db,
     pushSender: sender,
     tokenVerifier: verifier,
     logger: false,
-    calls: { twilio, transcriber, scorer, now: clock.now },
+    calls: { twilio, transcriber, scorer, now: clock.now, ...(voiceDetector ? { voiceDetector } : {}) },
   });
   await app.ready();
-  return { app, db, sender, verifier, config, twilio, transcriber, scorer, clock };
+  return { app, db, sender, verifier, config, twilio, transcriber, scorer, clock, ...(voiceDetector ? { voiceDetector } : {}) };
 }
 
 export async function closeTestApp(context: TestContext): Promise<void> {

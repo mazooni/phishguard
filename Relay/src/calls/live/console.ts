@@ -10,7 +10,7 @@ import { DEMO_CALLED_NUMBER, MAX_DEMO_SPEED, MIN_DEMO_SPEED, type DemoCallRunner
 import { startTestCall } from "../routes/devices.js";
 import type { CallSessionManager } from "../session.js";
 import type { TwilioClient } from "../twilio/client.js";
-import { DEMO_SCENARIO_IDS, redactNumber, type CallLine, type DemoScenarioId, type Transcriber } from "../types.js";
+import { DEMO_SCENARIO_IDS, redactNumber, type CallLine, type DemoScenarioId, type Transcriber, type VoiceDetector } from "../types.js";
 import { ensureWebSocketPlugin } from "../websocket.js";
 import type { LiveHub } from "./hub.js";
 
@@ -23,10 +23,11 @@ import type { LiveHub } from "./hub.js";
  *
  *   GET  /v1/calls/console                the page
  *   GET  /v1/calls/console/ws             WebSocket: every device's live events
- *   POST /v1/calls/console/demo           {lineID | deviceID, scenario, speed?} → 202 {callID}; 403 demo_disabled
+ *   POST /v1/calls/console/demo           {lineID | deviceID, scenario, speed?, aiVoice?} → 202 {callID}; 403 demo_disabled
  *   POST /v1/calls/console/test-call      {lineID, scenario} → 202 {callID}; 503 twilio_not_configured
  *   POST /v1/calls/console/replay         {lineID | deviceID} → 202 {callID, mediaToken, mediaPath} (a `replay`
- *                                         session); 503 openai_not_configured without a transcriber
+ *                                         session); 503 openai_not_configured with neither a transcriber nor a
+ *                                         voice detector
  *   POST /v1/calls/console/replay/end     {callID} → 200 (the replay script ends its session once the audio is in)
  *
  * A demo or a replay targets a line or, on a relay without Twilio (where no line can exist), a registered device
@@ -43,6 +44,8 @@ export interface ConsoleRoutesOptions {
   twilio: TwilioClient | undefined;
   /** What a replay session feeds (Media Streams → OpenAI); undefined without OPENAI_API_KEY. */
   transcriber?: Transcriber | undefined;
+  /** The other consumer of a replay's audio (the caller's track → AI-voice detection); undefined without MODULATE_API_KEY. */
+  voiceDetector?: VoiceDetector | undefined;
   now?: (() => number) | undefined;
 }
 
@@ -63,6 +66,8 @@ interface TargetBody {
 interface ConsoleDemoBody extends TargetBody {
   scenario: DemoScenarioId;
   speed?: number;
+  /** Also script the caller's voice as AI-generated (demo/runner.ts). */
+  aiVoice?: boolean;
 }
 
 interface ConsoleTestCallBody {
@@ -89,6 +94,7 @@ const demoBodySchema = {
     deviceID: lineIdSchema,
     scenario: scenarioSchema,
     speed: { type: "number", minimum: MIN_DEMO_SPEED, maximum: MAX_DEMO_SPEED },
+    aiVoice: { type: "boolean" },
   },
 } as const;
 
@@ -203,7 +209,7 @@ function sendTargetError(reply: FastifyReply, failure: TargetError): FastifyRepl
 }
 
 export function registerConsoleRoutes(app: FastifyInstance, options: ConsoleRoutesOptions): void {
-  const { config, calls, db, sessions, hub, demo, twilio, transcriber } = options;
+  const { config, calls, db, sessions, hub, demo, twilio, transcriber, voiceDetector } = options;
   const now = options.now ?? Date.now;
   ensureWebSocketPlugin(app);
 
@@ -244,7 +250,13 @@ export function registerConsoleRoutes(app: FastifyInstance, options: ConsoleRout
       if (!calls.demoEnabled) return reply.code(403).send({ error: "demo_disabled" });
       const target = resolveTarget(db, request.body);
       if ("error" in target) return sendTargetError(reply, target);
-      const session = demo.start({ deviceId: target.deviceId, line: target.line, scenario: request.body.scenario, speed: request.body.speed });
+      const session = demo.start({
+        deviceId: target.deviceId,
+        line: target.line,
+        scenario: request.body.scenario,
+        speed: request.body.speed,
+        aiVoice: request.body.aiVoice,
+      });
       return reply.code(202).send({ callID: session.callId });
     });
 
@@ -262,8 +274,9 @@ export function registerConsoleRoutes(app: FastifyInstance, options: ConsoleRout
     );
 
     scoped.post<{ Body: ReplayBody }>("/v1/calls/console/replay", { schema: { body: replayBodySchema }, bodyLimit: BODY_LIMIT }, async (request, reply) => {
-      // A replay is Media Streams audio into the OpenAI transcriber; without one it would produce nothing at all.
-      if (!transcriber) return reply.code(503).send({ error: "openai_not_configured" });
+      // A replay is Media Streams audio into the OpenAI transcriber and/or the voice detector; with neither it
+      // would produce nothing at all.
+      if (!transcriber && !voiceDetector) return reply.code(503).send({ error: "openai_not_configured" });
       const target = resolveTarget(db, request.body);
       if ("error" in target) return sendTargetError(reply, target);
       const session = sessions.create({
@@ -356,6 +369,8 @@ button{font:inherit;padding:6px 10px;border-radius:8px;border:1px solid var(--bo
 button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
 button:disabled{opacity:.45;cursor:not-allowed}
 select{font:inherit;padding:5px 8px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text)}
+label.chk{display:inline-flex;align-items:center;gap:4px;font-size:13px;color:var(--muted);cursor:pointer}
+label.chk input{margin:0}
 a{color:var(--accent)}
 .cards{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(380px,1fr))}
 .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px;display:grid;gap:10px;align-content:start}
@@ -382,6 +397,11 @@ a{color:var(--accent)}
 .line.partial{opacity:.5;font-style:italic}
 .alerts{display:grid;gap:4px;font-size:13px}
 .alert{padding:6px 8px;border-radius:8px;background:rgba(220,38,38,.12);border-left:3px solid var(--high)}
+.voice{font-size:13px;color:var(--muted)}
+.voice b{font-weight:600;margin-right:6px}
+.voice.synthetic{color:var(--text);padding:6px 8px;border-radius:8px;background:rgba(234,88,12,.12);border-left:3px solid var(--medium)}
+.voice.human b{color:var(--safe)}
+.pill.voice-synthetic{background:var(--medium);color:#fff}
 .history{display:grid;gap:6px}
 .hist{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:8px 12px;display:flex;gap:10px;align-items:center;font-size:14px;flex-wrap:wrap}
 .hist .muted{color:var(--muted)}
@@ -436,14 +456,20 @@ a{color:var(--accent)}
     var ctl = el("td", "ctl");
     var scenario = el("select"); data.scenarios.forEach(function (s) { var o = el("option", null, s.title); o.value = s.id; scenario.appendChild(o); });
     var speed = el("select"); [["0.5", "0.5×"], ["1", "1×"], ["2", "2×"], ["4", "4×"]].forEach(function (p) { var o = el("option", null, p[1]); o.value = p[0]; if (p[0] === "1") o.selected = true; speed.appendChild(o); });
+    // Scripts the caller's voice as AI-generated on top of the scenario: the AI-voice warning without Twilio or a detector.
+    var aiVoice = el("input"); aiVoice.type = "checkbox";
+    var aiVoiceLabel = el("label", "chk"); aiVoiceLabel.title = "Also script the caller's voice as AI-generated";
+    aiVoiceLabel.appendChild(aiVoice); aiVoiceLabel.appendChild(el("span", null, "AI voice"));
     var demoBtn = el("button", "primary", "Start demo call");
     demoBtn.onclick = function () {
       demoBtn.disabled = true;
-      post("/v1/calls/console/demo", Object.assign({ scenario: scenario.value, speed: Number(speed.value) }, target))
+      var body = Object.assign({ scenario: scenario.value, speed: Number(speed.value) }, target);
+      if (aiVoice.checked) body.aiVoice = true;
+      post("/v1/calls/console/demo", body)
         .then(function (j) { toast("Demo call started"); }).catch(function (e) { toast("Demo failed: " + e.message); })
         .then(function () { demoBtn.disabled = false; });
     };
-    ctl.appendChild(scenario); ctl.appendChild(speed); ctl.appendChild(demoBtn);
+    ctl.appendChild(scenario); ctl.appendChild(speed); ctl.appendChild(aiVoiceLabel); ctl.appendChild(demoBtn);
     if (withTestCall) {
       var testBtn = el("button", null, "Place test call");
       testBtn.disabled = !data.twilioConfigured;
@@ -507,13 +533,14 @@ a{color:var(--accent)}
   function ensureCall(summary) {
     var call = calls.get(summary.callID);
     if (!call) {
-      call = { id: summary.callID, summary: summary, segments: new Map(), order: [], verdict: summary.verdict || null, alerts: [], ended: false, card: null };
+      call = { id: summary.callID, summary: summary, segments: new Map(), order: [], verdict: summary.verdict || null, voice: summary.voice || null, alerts: [], ended: false, card: null };
       calls.set(summary.callID, call);
       call.card = buildCard(call);
       $("live").appendChild(call.card.root);
     } else {
       call.summary = summary;
       if (summary.verdict && (!call.verdict || summary.verdict.sequence >= call.verdict.sequence)) call.verdict = summary.verdict;
+      if (summary.voice && (!call.voice || summary.voice.updatedAt >= call.voice.updatedAt)) call.voice = summary.voice;
     }
     updateCard(call);
     return call;
@@ -537,10 +564,34 @@ a{color:var(--accent)}
     top.appendChild(gauge); top.appendChild(who); top.appendChild(status);
     var summary = el("div", "summary hidden"); var action = el("div", "action hidden");
     var reasons = el("ul", "reasons hidden");
+    var voice = el("div", "voice hidden");
     var transcript = el("div", "transcript");
     var alerts = el("div", "alerts hidden");
-    root.appendChild(top); root.appendChild(summary); root.appendChild(action); root.appendChild(reasons); root.appendChild(transcript); root.appendChild(alerts);
-    return { root: root, fg: fg, val: val, caller: caller, meta: meta, status: status, summary: summary, action: action, reasons: reasons, transcript: transcript, alerts: alerts };
+    root.appendChild(top); root.appendChild(summary); root.appendChild(action); root.appendChild(reasons); root.appendChild(voice); root.appendChild(transcript); root.appendChild(alerts);
+    return { root: root, fg: fg, val: val, caller: caller, meta: meta, status: status, summary: summary, action: action, reasons: reasons, voice: voice, transcript: transcript, alerts: alerts };
+  }
+
+  // The AI-voice assessment of the caller: its own line, never part of the scam gauge (a synthetic voice is not a scam verdict).
+  var VOICE_WORDS = {
+    analyzing: "listening to the caller's voice…",
+    human: "sounds human",
+    synthetic: "appears AI-generated",
+    inconclusive: "not enough speech to tell",
+    unavailable: "voice check unavailable"
+  };
+  function voiceText(v) {
+    var text = VOICE_WORDS[v.status] || String(v.status);
+    if (v.status === "synthetic" || v.status === "human" || (v.status === "analyzing" && v.speechMs > 0)) text += "  ·  " + Math.round(v.syntheticShare * 100) + "% of the speech judged synthetic";
+    if (v.alert) text += "  ·  warned · " + (v.alert.pushed ? "pushed" : "not pushed") + (v.alert.spoken ? " · spoken" : "");
+    return text;
+  }
+  function updateVoice(call) {
+    var box = call.card.voice, v = call.voice;
+    box.textContent = "";
+    box.className = "voice" + (v ? " " + (VOICE_WORDS[v.status] ? v.status : "") : " hidden");
+    if (!v) return;
+    box.appendChild(el("b", null, "Caller's voice"));
+    box.appendChild(el("span", null, voiceText(v)));
   }
 
   function updateCard(call) {
@@ -549,6 +600,7 @@ a{color:var(--accent)}
     c.status.textContent = s.status.replace("_", " ");
     c.status.className = "pill " + (v ? v.level : "");
     updateElapsed(call);
+    updateVoice(call);
     if (v) {
       var pct = Math.round(v.confidence * 100);
       c.val.textContent = pct + "%";
@@ -586,7 +638,7 @@ a{color:var(--accent)}
   }
 
   function endCall(call, summary) {
-    call.summary = summary; if (summary.verdict) call.verdict = summary.verdict; call.ended = true;
+    call.summary = summary; if (summary.verdict) call.verdict = summary.verdict; if (summary.voice) call.voice = summary.voice; call.ended = true;
     updateCard(call);
     setTimeout(function () {
       if (call.card.root.parentNode) call.card.root.parentNode.removeChild(call.card.root);
@@ -595,6 +647,7 @@ a{color:var(--accent)}
       h.appendChild(el("strong", null, fmtPhone(summary.callerNumber)));
       h.appendChild(el("span", "muted", summary.source + " · " + summary.status.replace("_", " ") + " · " + fmtElapsed((summary.durationSeconds || 0) * 1000) + " · " + fmtTime(summary.startedAt)));
       if (call.verdict && call.verdict.summary) h.appendChild(el("span", "grow", call.verdict.summary));
+      if (call.voice) h.appendChild(el("span", call.voice.status === "synthetic" ? "pill voice-synthetic" : "muted", "voice: " + voiceText(call.voice)));
       if (summary.alerted) h.appendChild(el("span", "pill high", "alerted"));
       var hist = $("history"); hist.insertBefore(h, hist.firstChild); $("histEmpty").classList.add("hidden");
       refreshEmpty();
@@ -623,6 +676,7 @@ a{color:var(--accent)}
         case "transcript.segment": call = calls.get(ev.callID); if (call) addSegment(call, ev.segment); break;
         case "verdict.updated": call = calls.get(ev.callID); if (call && (!call.verdict || ev.verdict.sequence >= call.verdict.sequence)) { call.verdict = ev.verdict; updateCard(call); } break;
         case "call.alert": call = calls.get(ev.callID); if (call) { call.summary.alerted = true; call.summary.alertLevel = ev.alert.level; addAlert(call, ev.alert); updateCard(call); } break;
+        case "voice.updated": call = calls.get(ev.callID); if (call) { call.voice = ev.voice; if (ev.voice.alert) call.summary.alerted = true; updateCard(call); } break;
         case "call.ended": call = calls.get(ev.call.callID); if (call) endCall(call, ev.call); break;
         default: break;
       }

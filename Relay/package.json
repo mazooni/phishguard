@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "calls:setup": "node --env-file-if-exists=.env --import tsx scripts/twilio-setup.ts",
     "calls:replay": "node --env-file-if-exists=.env --import tsx scripts/replay-call.ts",
+    "calls:voice-check": "node --env-file-if-exists=.env --import tsx scripts/modulate-voice-check.ts",
     "calls:export-demo-verdicts": "node --import tsx scripts/export-demo-verdicts.ts"
   },
   "dependencies": {

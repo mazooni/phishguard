@@ -63,3 +63,19 @@ export function alertText(level: AlertLevel, callerNumber: string, reasons: read
     body: alertBody(reasons, summary),
   };
 }
+
+// MARK: the AI-voice warning (a separate alert: a synthetic voice is not a scam verdict).
+
+export const VOICE_ALERT_TITLE = "AI voice detected";
+export const VOICE_ALERT_BODY =
+  "The caller's voice appears to be AI-generated. If they say they are someone you know, hang up and call them back on a number you trust.";
+/**
+ * Appended to the spoken scam warning on a test call whose "caller" was judged synthetic: a test call can carry
+ * one announcement only (it replaces the call's TwiML), so the two warnings share it.
+ */
+export const VOICE_SPOKEN_ADDENDUM = "Also, the caller's voice appears to be A.I. generated.";
+
+/** Fixed words: nothing about the call but the caller's number goes into the AI-voice alert. */
+export function voiceAlertText(callerNumber: string): AlertText {
+  return { title: VOICE_ALERT_TITLE, subtitle: alertSubtitle(callerNumber), body: VOICE_ALERT_BODY };
+}
